@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { db, auth, googleProvider } from '@/lib/firebase';
 import {
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   onAuthStateChanged,
   User,
@@ -92,12 +93,17 @@ export default function SermonApp() {
     return () => unsubscribe();
   }, []);
 
-const handleLogin = async () => {
+  const handleLogin = async () => {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err: any) {
-      console.error('로그인 에러:', err);
-      alert(`로그인 실패 코드: [${err.code}]\n${err.message}`);
+      if (err.code === 'auth/popup-blocked') {
+        // 팝업이 차단된 기기(아이폰 사파리/크롬 팝업 제한 등)에서는 페이지 이동 방식으로 자동 전환
+        await signInWithRedirect(auth, googleProvider);
+      } else {
+        console.error('로그인 에러:', err);
+        alert(`로그인 실패 코드: [${err.code}]\n${err.message}`);
+      }
     }
   };
 
@@ -571,7 +577,7 @@ const handleLogin = async () => {
     );
   }
 
-  // 로그인 화면 (로그인되지 않은 경우)
+  // 로그인 화면
   if (!user) {
     return (
       <div className="h-screen bg-neutral-900 flex flex-col items-center justify-center p-4 text-white">
