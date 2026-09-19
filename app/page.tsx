@@ -92,11 +92,12 @@ export default function SermonApp() {
     return () => unsubscribe();
   }, []);
 
-  const handleLogin = async () => {
+const handleLogin = async () => {
     try {
       await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      alert('로그인에 실패했습니다.');
+    } catch (err: any) {
+      console.error('로그인 에러:', err);
+      alert(`로그인 실패 코드: [${err.code}]\n${err.message}`);
     }
   };
 
