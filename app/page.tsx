@@ -20,12 +20,18 @@ import {
   deleteDoc,
 } from 'firebase/firestore';
 
+// 기본 분류 목록
 const DEFAULT_CATEGORIES = [
   { id: 'sunday', name: '주일설교' },
   { id: 'dawn', name: '새벽기도' },
   { id: 'wednesday', name: '수요예배' },
   { id: 'special', name: '특별/기타' },
 ];
+
+interface Category {
+  id: string;
+  name: string;
+}
 
 interface Sermon {
   id: string;
@@ -35,19 +41,136 @@ interface Sermon {
   content: string;
   category: string;
   updatedAt: string;
+  order?: number;
+}
+
+// ── 본문 저장 형식 헬퍼 ──────────────────────────────────────────
+// 옛 설교는 평문 + ==형광펜== 마커로 저장되어 있고, 새 에디터는 표를 담을 수
+// 있는 HTML로 저장한다. 읽을 때 평문이면 그 자리에서 HTML로 승격시켜서
+// 두 형식을 영구히 같이 처리하지 않도록 한다.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function isHtml(str: string): boolean {
+  return /<[a-z][\s\S]*>/i.test(str);
+}
+
+function legacyMarksToHtml(text: string): string {
+  const escaped = escapeHtml(text);
+  const withMarks = escaped.replace(
+    /==(?:([ygp]):)?([\s\S]*?)==/g,
+    (_m, colorCode: string | undefined, inner: string) => {
+      const cls = colorCode === 'g' ? 'hl-green' : colorCode === 'p' ? 'hl-pink' : 'hl-yellow';
+      return `<mark class="${cls}">${inner}</mark>`;
+    }
+  );
+  return withMarks.replace(/\n/g, '<br>');
+}
+
+function ensureHtml(raw: string): string {
+  if (!raw) return '';
+  return isHtml(raw) ? raw : legacyMarksToHtml(raw);
+}
+
+// 검색 매칭/스니펫은 항상 태그를 걷어낸 평문 기준으로 계산한다 (오프셋이
+// contentEditable의 텍스트 노드 순회와 1:1로 맞아야 해서 치환만 하고 아무 것도 끼워넣지 않음)
+function toPlainText(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+// 태그 안쪽은 건드리지 않고, 텍스트 구간에만 검색어 하이라이트 마크를 끼워넣는다
+function highlightHtml(html: string, query: string): string {
+  const q = query.trim();
+  if (!q) return html;
+  const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(escapedQ, 'gi');
+  return html.replace(/(<[^>]+>)|([^<]+)/g, (whole, tag: string, text: string) => {
+    if (tag) return tag;
+    return text.replace(regex, (m: string) => `<mark class="hl-search">${m}</mark>`);
+  });
+}
+
+function findTextNodeAndOffset(
+  root: Node,
+  targetOffset: number
+): { node: Node; offset: number } | null {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let consumed = 0;
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    const len = node.textContent?.length ?? 0;
+    if (consumed + len >= targetOffset) {
+      return { node, offset: targetOffset - consumed };
+    }
+    consumed += len;
+  }
+  return null;
+}
+
+function unwrapMark(markEl: Element) {
+  const parent = markEl.parentNode;
+  if (!parent) return;
+  while (markEl.firstChild) parent.insertBefore(markEl.firstChild, markEl);
+  parent.removeChild(markEl);
+}
+
+const BLOCK_TAGS = new Set([
+  'DIV', 'P', 'LI', 'UL', 'OL', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'BLOCKQUOTE', 'TABLE', 'TBODY', 'THEAD', 'TR', 'TD', 'TH',
+]);
+
+// <mark>은 인라인 태그라 <div> 같은 블록을 감쌀 수 없다 — 그렇게 하면 브라우저가
+// HTML을 파싱하면서 mark를 앞/뒤로 쪼개버린다 (여러 줄 선택 시 "앞뒤로 반만 칠해지는" 버그).
+// 그래서 블록 경계는 그대로 두고, 그 안에 있는 인라인 내용(텍스트/<br>)만 이어서 감싼다 —
+// 한 줄짜리 선택은 통째로 하나의 <mark>가 되고, 여러 줄(= 여러 블록)이면 줄마다 각각 감싼다.
+function wrapInlineRuns(parent: Node, className: string) {
+  const children = Array.from(parent.childNodes);
+  let currentMark: HTMLElement | null = null;
+
+  for (const child of children) {
+    const isBlock = child.nodeType === 1 && BLOCK_TAGS.has((child as Element).tagName);
+    if (isBlock) {
+      currentMark = null;
+      wrapInlineRuns(child, className);
+    } else {
+      if (!currentMark) {
+        currentMark = document.createElement('mark');
+        currentMark.className = className;
+        parent.insertBefore(currentMark, child);
+      }
+      currentMark.appendChild(child);
+    }
+  }
 }
 
 export default function SermonApp() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
+
+  const [categories, setCategories] = useState<Category[]>(DEFAULT_CATEGORIES);
   const [currentCategory, setCurrentCategory] = useState('sunday');
   const [sermons, setSermons] = useState<Sermon[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const activeIdRef = useRef<string | null>(null);
 
+  // 사이드바 토글 (기본 열림)
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [viewMode, setViewMode] = useState<'split' | 'edit' | 'preview'>('split');
+
+  // 본문 뷰 모드: 'edit'(수정만, 기본값) | 'split'(나란히 보기) | 'preview'(보기만)
+  const [viewMode, setViewMode] = useState<'split' | 'edit' | 'preview'>('edit');
+
+  // 모바일 드릴다운: 분류 목록 → 설교 목록 → 편집창 (데스크톱에서는 셋 다 한 화면에 표시)
+  const [mobilePane, setMobilePane] = useState<'categories' | 'sermons' | 'editor'>('categories');
+  const pendingRestoreIdRef = useRef<string | null>(null);
 
   const [title, setTitle] = useState('');
   const [date, setDate] = useState('');
@@ -56,34 +179,68 @@ export default function SermonApp() {
   const [syncStatus, setSyncStatus] = useState('동기화 완료');
   const [isOnline, setIsOnline] = useState(true);
 
-  // 실행 취소 / 다시 실행
-  const historyRef = useRef<{ past: string[]; future: string[] }>({ past: [], future: [] });
+  // ↶ 되돌리기 / ↷ 다시 실행 독립 히스토리
+  const historyRef = useRef<{ past: string[]; future: string[] }>({
+    past: [],
+    future: [],
+  });
   const [historyCount, setHistoryCount] = useState({ past: 0, future: 0 });
   const contentRef = useRef(content);
   contentRef.current = content;
 
+  // 타이핑 감지용 Ref
   const isTypingBatchRef = useRef(false);
   const typingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // 검색
+  // 통합 검색 상태
   const [searchQuery, setSearchQuery] = useState('');
   const [allSermonsForSearch, setAllSermonsForSearch] = useState<Sermon[]>([]);
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
 
-  // 강단 모드
+  // 강단 모드 및 타이머
   const [isPulpitMode, setIsPulpitMode] = useState(false);
   const [fontSize, setFontSize] = useState(24);
   const [timerSeconds, setTimerSeconds] = useState(0);
   const [isTimerRunning, setIsTimerRunning] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // 본문을 아래로 스크롤하면 제목/날짜/본문 구절 칸을 숨겨서 쓰는 공간을 넓혀준다
+  const [showMetaFields, setShowMetaFields] = useState(true);
+  const lastScrollTopRef = useRef(0);
+  const scrollDebounceRef = useRef<NodeJS.Timeout | null>(null);
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const editableRef = useRef<HTMLDivElement | null>(null);
+  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // 형광펜 버튼을 누르는 순간(특히 모바일) 브라우저가 드래그 선택을 먼저
+  // 풀어버리는 경우가 있어서, 선택이 바뀔 때마다 마지막 드래그 범위를 따로 저장해둔다
+  const savedRangeRef = useRef<Range | null>(null);
+
+  // activeId 변경 시 Ref 동기화
   useEffect(() => {
     activeIdRef.current = activeId;
   }, [activeId]);
 
+  // 🔖 마지막으로 보던 분류/설교 복원 (앱을 다시 켰을 때 늘 첫 분류로 돌아가지 않도록)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('sermon_last_open') || 'null');
+      if (saved?.category) {
+        setCurrentCategory(saved.category);
+        pendingRestoreIdRef.current = saved.id || null;
+        setMobilePane(saved.id ? 'editor' : 'sermons');
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 현재 보고 있는 분류/설교를 기억해 둔다
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('sermon_last_open', JSON.stringify({ category: currentCategory, id: activeId }));
+  }, [currentCategory, activeId]);
+
+  // 히스토리 상태 업데이트 헬퍼
   // 구글 로그인 상태 감지
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -114,6 +271,11 @@ export default function SermonApp() {
       activeIdRef.current = null;
       setSermons([]);
       setAllSermonsForSearch([]);
+      setCategories(DEFAULT_CATEGORIES);
+      // 같은 기기를 다른 계정이 쓸 때 이전 계정 캐시가 보이지 않도록
+      Object.keys(localStorage)
+        .filter((k) => /^(sermons_|all_sermons_backup|sermon_categories|sermon_last_open)/.test(k))
+        .forEach((k) => localStorage.removeItem(k));
     }
   };
 
@@ -124,17 +286,24 @@ export default function SermonApp() {
     });
   };
 
+  // 현재 본문 상태를 되돌리기 스택에 기록
   const recordHistoryBeforeChange = (textToSave: string) => {
     historyRef.current.past.push(textToSave);
-    if (historyRef.current.past.length > 40) historyRef.current.past.shift();
+    if (historyRef.current.past.length > 40) {
+      historyRef.current.past.shift();
+    }
     historyRef.current.future = [];
     updateHistoryState();
   };
 
-  const handleContentChange = (newVal: string) => {
-    const currentText = contentRef.current;
+  // 본문 타이핑 핸들러 (contentEditable DOM이 원본이고, state는 그걸 따라간다)
+  const handleEditableInput = () => {
+    const newHtml = editableRef.current?.innerHTML ?? '';
+    const currentHtml = contentRef.current;
+    const targetId = activeIdRef.current; // 지금 바로 읽어서 묶어둔다 — 0.4초 뒤 다른 설교로 넘어가도 안전하게
+
     if (!isTypingBatchRef.current) {
-      recordHistoryBeforeChange(currentText);
+      recordHistoryBeforeChange(currentHtml);
       isTypingBatchRef.current = true;
     }
 
@@ -143,47 +312,135 @@ export default function SermonApp() {
       isTypingBatchRef.current = false;
     }, 800);
 
-    setContent(newVal);
+    setContent(newHtml);
 
     setSyncStatus('저장 대기 중...');
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveToCloud(title, date, scripture, newVal);
+      saveToCloud(targetId, title, date, scripture, newHtml);
     }, 400);
   };
 
+  // 표 삽입/형광펜처럼 DOM을 직접 바꾼 뒤 state·클라우드에 그 결과를 반영할 때 쓴다
+  const commitChange = () => {
+    const html = editableRef.current?.innerHTML ?? '';
+    setContent(html);
+    setSyncStatus('저장 대기 중...');
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveToCloud(activeIdRef.current, title, date, scripture, html);
+  };
+
+  // 다른 설교를 선택했거나(화면 전환) 보기 모드를 바꿔서 에디터 DOM이 다시
+  // 그려졌을 때만 내용을 채워 넣는다. 타이핑 중에는 절대 다시 쓰지 않는다
+  // (그러면 매 글자마다 커서가 맨 앞으로 튀어버린다).
+  // isPulpitMode도 포함: 강단 모드는 별도 return 분기라 편집창 DOM이 통째로
+  // 사라졌다가 돌아올 때 새로 생기므로, 그때도 다시 채워 넣어야 한다.
+  useEffect(() => {
+    if (editableRef.current) {
+      editableRef.current.innerHTML = ensureHtml(contentRef.current);
+    }
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
+    setShowMetaFields(true);
+    lastScrollTopRef.current = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, viewMode, isPulpitMode]);
+
+  // 본문 스크롤 방향에 따라 제목/날짜/본문 구절 칸을 숨기거나 보여준다.
+  // 붙여넣기로 본문이 갑자기 길어지면 브라우저가 커서를 보이게 하려고 스크롤을
+  // 여러 번 잘게 움직이는데, 그걸 그대로 따라가면 숨김/보임이 깜빡인다. 그래서
+  // 스크롤이 잠시 멈춘 뒤의 최종 위치만 보고 판단한다.
+  const handleEditorScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const top = e.currentTarget.scrollTop;
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
+    scrollDebounceRef.current = setTimeout(() => {
+      const last = lastScrollTopRef.current;
+      if (top <= 4) {
+        setShowMetaFields(true);
+      } else if (top > last + 4) {
+        setShowMetaFields(false);
+      } else if (top < last - 4) {
+        setShowMetaFields(true);
+      }
+      lastScrollTopRef.current = top;
+    }, 120);
+  };
+
+  // 설교를 바꾸면 이전 설교의 드래그 범위를 들고 있지 않도록 비운다
+  useEffect(() => {
+    savedRangeRef.current = null;
+  }, [activeId]);
+
+  // 드래그로 선택한 범위를 실시간으로 저장해 둔다 (형광펜 버튼 클릭 시점엔
+  // 이미 선택이 풀려 있을 수 있어서, 버튼이 눌리는 순간 새로 묻는 대신 이걸 쓴다)
+  useEffect(() => {
+    const handleSelectionChange = () => {
+      const sel = window.getSelection();
+      const editable = editableRef.current;
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !editable) return;
+      const range = sel.getRangeAt(0);
+      if (editable.contains(range.commonAncestorContainer)) {
+        savedRangeRef.current = range.cloneRange();
+      }
+    };
+    document.addEventListener('selectionchange', handleSelectionChange);
+    return () => document.removeEventListener('selectionchange', handleSelectionChange);
+  }, []);
+
+  // ↶ 되돌리기 (Undo)
   const handleUndo = () => {
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     isTypingBatchRef.current = false;
-    if (historyRef.current.past.length === 0) return;
+
+    if (historyRef.current.past.length === 0) {
+      alert('되돌릴 이전 작업 내역이 없습니다.');
+      return;
+    }
 
     const previous = historyRef.current.past.pop()!;
     historyRef.current.future.unshift(contentRef.current);
     updateHistoryState();
 
+    if (editableRef.current) editableRef.current.innerHTML = previous;
     setContent(previous);
-    saveToCloud(title, date, scripture, previous);
-    setTimeout(() => textareaRef.current?.focus(), 20);
+    saveToCloud(activeIdRef.current, title, date, scripture, previous);
+
+    setTimeout(() => editableRef.current?.focus(), 20);
   };
 
+  // ↷ 다시 실행 (Redo)
   const handleRedo = () => {
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     isTypingBatchRef.current = false;
-    if (historyRef.current.future.length === 0) return;
+
+    if (historyRef.current.future.length === 0) {
+      alert('다시 실행할 다음 작업 내역이 없습니다.');
+      return;
+    }
 
     const next = historyRef.current.future.shift()!;
     historyRef.current.past.push(contentRef.current);
     updateHistoryState();
 
+    if (editableRef.current) editableRef.current.innerHTML = next;
     setContent(next);
-    saveToCloud(title, date, scripture, next);
-    setTimeout(() => textareaRef.current?.focus(), 20);
+    saveToCloud(activeIdRef.current, title, date, scripture, next);
+
+    setTimeout(() => editableRef.current?.focus(), 20);
   };
 
-  // 온라인 상태 감지
+  // Enter로 줄바꿈할 때 브라우저 기본값(새 <div> 생성) 대신 <br>을 쓰게 한다 —
+  // 그래야 여러 줄을 형광펜으로 선택했을 때 줄마다 블록으로 쪼개지지 않는다.
+  useEffect(() => {
+    try {
+      document.execCommand('defaultParagraphSeparator', false, 'br');
+    } catch {}
+  }, []);
+
+  // 오프라인 상태 감지 및 서비스워커 등록
   useEffect(() => {
     if (typeof window !== 'undefined') {
       setIsOnline(navigator.onLine);
+
       const handleOnline = () => {
         setIsOnline(true);
         setSyncStatus('온라인 복구 (동기화 완료)');
@@ -207,10 +464,147 @@ export default function SermonApp() {
     }
   }, []);
 
-  // 사용자별 전체 설교 데이터 수집 (검색용)
+  // 📁 분류(카테고리) 목록 로드 및 실시간 동기화
   useEffect(() => {
     if (!user) return;
-    const q = query(collection(db, 'users', user.uid, 'sermons'));
+    if (typeof window !== 'undefined') {
+      const cachedCats = localStorage.getItem('sermon_categories');
+      if (cachedCats) {
+        try {
+          const parsed = JSON.parse(cachedCats);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setCategories(parsed);
+          }
+        } catch (e) {}
+      }
+    }
+
+    const catDocRef = doc(db, 'users', user!.uid, 'settings', 'categories');
+    const unsubscribe = onSnapshot(
+      catDocRef,
+      (snapshot) => {
+        if (snapshot.exists() && snapshot.data()?.list) {
+          const cloudCats: Category[] = snapshot.data().list;
+          if (cloudCats.length > 0) {
+            setCategories(cloudCats);
+            if (typeof window !== 'undefined') {
+              localStorage.setItem('sermon_categories', JSON.stringify(cloudCats));
+            }
+          }
+        } else {
+          // 최초 실행 시 기본 카테고리 Firestore에 저장
+          setDoc(catDocRef, { list: DEFAULT_CATEGORIES }, { merge: true });
+        }
+      },
+      () => {
+        // 오프라인 에러 시 기본/캐시 유지
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // ➕ 새 분류 추가 함수
+  const handleAddCategory = async () => {
+    const name = prompt('추가할 새 예배/설교 분류 이름을 입력하세요:');
+    if (!name || !name.trim()) return;
+
+    const trimmedName = name.trim();
+    if (categories.some((c) => c.name === trimmedName)) {
+      alert('이미 존재하는 분류 이름입니다.');
+      return;
+    }
+
+    const newCategory: Category = {
+      id: `cat_${Date.now()}`,
+      name: trimmedName,
+    };
+
+    const updated = [...categories, newCategory];
+    setCategories(updated);
+    setCurrentCategory(newCategory.id);
+    setActiveId(null);
+    activeIdRef.current = null;
+
+    try {
+      await setDoc(doc(db, 'users', user!.uid, 'settings', 'categories'), { list: updated });
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('sermon_categories', JSON.stringify(updated));
+      }
+    } catch {
+      alert('분류 저장 중 오류가 발생했습니다.');
+    }
+  };
+
+  // ✏️ 분류 이름 변경
+  const handleRenameCategory = async (cat: Category, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const name = prompt('새 분류 이름을 입력하세요:', cat.name);
+    if (!name || !name.trim() || name.trim() === cat.name) return;
+
+    const trimmedName = name.trim();
+    if (categories.some((c) => c.id !== cat.id && c.name === trimmedName)) {
+      alert('이미 존재하는 분류 이름입니다.');
+      return;
+    }
+
+    const updated = categories.map((c) => (c.id === cat.id ? { ...c, name: trimmedName } : c));
+    setCategories(updated);
+
+    try {
+      await setDoc(doc(db, 'users', user!.uid, 'settings', 'categories'), { list: updated });
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('sermon_categories', JSON.stringify(updated));
+      }
+    } catch {
+      alert('분류 이름 변경 중 오류가 발생했습니다.');
+    }
+  };
+
+  // ❌ 분류 삭제 함수 (비밀번호 0316 검증)
+  const handleDeleteCategory = async (catToDelete: Category, e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    if (categories.length <= 1) {
+      alert('최소 1개의 분류는 유지되어야 합니다.');
+      return;
+    }
+
+    // 해당 카테고리에 설교가 있는지 확인
+    const sermonsInThisCat = allSermonsForSearch.filter((s) => s.category === catToDelete.id);
+    let confirmPrompt = `'${catToDelete.name}' 분류를 삭제하시겠습니까?`;
+
+    if (sermonsInThisCat.length > 0) {
+      confirmPrompt += `\n\n⚠️ 주의: 이 분류에 작성된 설교가 총 ${sermonsInThisCat.length}개 있습니다.\n분류를 삭제해도 설교 원고 자체는 안전하게 보관되지만, 목록에서 찾기 어려워질 수 있습니다.`;
+    }
+
+    if (!confirm(confirmPrompt)) return;
+
+    // 2차 보안 비밀번호 검증
+    const updated = categories.filter((c) => c.id !== catToDelete.id);
+    setCategories(updated);
+
+    // 삭제된 카테고리를 보고 있었다면 첫 번째 카테고리로 안전 이동
+    if (currentCategory === catToDelete.id) {
+      setCurrentCategory(updated[0].id);
+      setActiveId(null);
+      activeIdRef.current = null;
+    }
+
+    try {
+      await setDoc(doc(db, 'users', user!.uid, 'settings', 'categories'), { list: updated });
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('sermon_categories', JSON.stringify(updated));
+      }
+    } catch {
+      alert('분류 삭제 중 오류가 발생했습니다.');
+    }
+  };
+
+  // 전체 설교 데이터 수집 (통합 검색용)
+  useEffect(() => {
+    if (!user) return;
+    const q = query(collection(db, 'users', user!.uid, 'sermons'));
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
@@ -228,21 +622,51 @@ export default function SermonApp() {
           });
         });
         setAllSermonsForSearch(list);
+        if (typeof window !== 'undefined' && list.length > 0) {
+          localStorage.setItem('all_sermons_backup', JSON.stringify(list));
+        }
       },
-      () => {}
+      () => {
+        if (typeof window !== 'undefined') {
+          const cachedAll = localStorage.getItem('all_sermons_backup');
+          if (cachedAll) {
+            try {
+              setAllSermonsForSearch(JSON.parse(cachedAll));
+            } catch (e) {}
+          }
+        }
+      }
     );
     return () => unsubscribe();
   }, [user]);
 
-  // 사용자별 현재 카테고리 설교 목록 불러오기
+  // 현재 카테고리 설교 목록 로드
   useEffect(() => {
     if (!user) return;
+    if (typeof window !== 'undefined') {
+      const cached = localStorage.getItem(`sermons_${currentCategory}`);
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          if (parsed && parsed.length > 0) {
+            setSermons(parsed);
+            if (!activeIdRef.current) {
+              setActiveId(parsed[0].id);
+              activeIdRef.current = parsed[0].id;
+              setTitle(parsed[0].title);
+              setDate(parsed[0].date);
+              setScripture(parsed[0].scripture);
+              setContent(parsed[0].content);
+              historyRef.current = { past: [], future: [] };
+              updateHistoryState();
+            }
+          }
+        } catch (e) {}
+      }
+    }
 
     setSyncStatus(navigator.onLine ? '동기화 중...' : '오프라인 캐시 사용 중');
-    const q = query(
-      collection(db, 'users', user.uid, 'sermons'),
-      where('category', '==', currentCategory)
-    );
+    const q = query(collection(db, 'users', user!.uid, 'sermons'), where('category', '==', currentCategory));
 
     const unsubscribe = onSnapshot(
       q,
@@ -258,25 +682,49 @@ export default function SermonApp() {
             content: data.content || '',
             category: data.category || currentCategory,
             updatedAt: data.updatedAt || '',
+            order: typeof data.order === 'number' ? data.order : undefined,
           });
         });
 
-        list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+        // 직접 정한 순서(order)가 있는 설교가 먼저, 나머지는 최근 수정순. 새 설교는 order가 가장 작아 맨 위로 간다.
+        list.sort((a, b) =>
+          a.order !== undefined && b.order !== undefined
+            ? a.order - b.order
+            : a.order !== undefined
+              ? -1
+              : b.order !== undefined
+                ? 1
+                : (b.updatedAt || '').localeCompare(a.updatedAt || '')
+        );
         setSermons(list);
 
+        if (typeof window !== 'undefined' && list.length > 0) {
+          localStorage.setItem(`sermons_${currentCategory}`, JSON.stringify(list));
+        }
+
         const curActive = activeIdRef.current;
+        const restoreId = pendingRestoreIdRef.current;
+        pendingRestoreIdRef.current = null; // 복원은 분류당 한 번만 적용
+
+        let target: Sermon | null = null;
         if (list.length > 0) {
-          if (!curActive || !list.some((s) => s.id === curActive)) {
-            setActiveId(list[0].id);
-            activeIdRef.current = list[0].id;
-            setTitle(list[0].title);
-            setDate(list[0].date);
-            setScripture(list[0].scripture);
-            setContent(list[0].content);
-            historyRef.current = { past: [], future: [] };
-            updateHistoryState();
+          if (restoreId) {
+            target = list.find((s) => s.id === restoreId) || list[0];
+          } else if (!curActive || !list.some((s) => s.id === curActive)) {
+            target = list[0];
           }
-        } else {
+        }
+
+        if (target) {
+          setActiveId(target.id);
+          activeIdRef.current = target.id;
+          setTitle(target.title);
+          setDate(target.date);
+          setScripture(target.scripture);
+          setContent(target.content);
+          historyRef.current = { past: [], future: [] };
+          updateHistoryState();
+        } else if (list.length === 0) {
           setActiveId(null);
           activeIdRef.current = null;
           setTitle('');
@@ -287,13 +735,13 @@ export default function SermonApp() {
           updateHistoryState();
         }
 
-        setSyncStatus(navigator.onLine ? '실시간 동기화 완료' : '오프라인 모드');
+        setSyncStatus(navigator.onLine ? '실시간 동기화 완료' : '오프라인 모드 작동 중');
       },
       () => setSyncStatus('오프라인 안전 보관 모드')
     );
 
     return () => unsubscribe();
-  }, [user, currentCategory]);
+  }, [currentCategory, user]);
 
   const selectSermon = (s: Sermon) => {
     setCurrentCategory(s.category);
@@ -306,6 +754,7 @@ export default function SermonApp() {
     setCurrentMatchIndex(0);
     historyRef.current = { past: [], future: [] };
     updateHistoryState();
+    setMobilePane('editor');
   };
 
   const createNewSermon = async (
@@ -314,17 +763,17 @@ export default function SermonApp() {
     initialScripture = '',
     initialContent = ''
   ) => {
-    if (!user) return;
     setSyncStatus('생성 중...');
     try {
       const today = initialDate || new Date().toISOString().slice(0, 10);
-      const docRef = await addDoc(collection(db, 'users', user.uid, 'sermons'), {
+      const docRef = await addDoc(collection(db, 'users', user!.uid, 'sermons'), {
         title: initialTitle,
         date: today,
         scripture: initialScripture,
         content: initialContent,
         category: currentCategory,
         updatedAt: new Date().toISOString(),
+        order: -Date.now(),
       });
       setActiveId(docRef.id);
       activeIdRef.current = docRef.id;
@@ -335,33 +784,36 @@ export default function SermonApp() {
       historyRef.current = { past: [], future: [] };
       updateHistoryState();
       setSyncStatus('저장 완료');
+      setMobilePane('editor');
     } catch {
       setSyncStatus('생성 오류');
     }
   };
 
+  // targetId는 반드시 "저장을 예약하는 시점"에 넘겨 받는다. 0.4초 디바운스가 끝나기 전에
+  // 다른 설교로 넘어가면 activeIdRef.current가 이미 바뀌어 있어서, 그 시점에 다시 읽으면
+  // 방금 쓴 글이 전혀 다른 설교 문서를 덮어써 버린다 (이게 "글이 자기가 바뀐다" 버그의 원인).
   const saveToCloud = async (
+    targetId: string | null,
     newTitle: string,
     newDate: string,
     newScripture: string,
     newContent: string
   ) => {
-    const targetId = activeIdRef.current;
-    if (!user || !targetId) return;
+    if (!targetId) return;
     try {
       await setDoc(
-        doc(db, 'users', user.uid, 'sermons', targetId),
+        doc(db, 'users', user!.uid, 'sermons', targetId),
         {
           title: newTitle,
           date: newDate,
           scripture: newScripture,
           content: newContent,
-          category: currentCategory,
           updatedAt: new Date().toISOString(),
         },
         { merge: true }
       );
-      setSyncStatus(navigator.onLine ? '실시간 동기화 완료' : '오프라인 보관 중');
+      setSyncStatus(navigator.onLine ? '실시간 동기화 완료' : '오프라인 보관 중 (연결 시 동기화)');
     } catch {
       setSyncStatus('저장 오류');
     }
@@ -369,10 +821,9 @@ export default function SermonApp() {
 
   const deleteSermon = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!user) return;
     if (!confirm('이 설교 원고를 삭제하시겠습니까?')) return;
     try {
-      await deleteDoc(doc(db, 'users', user.uid, 'sermons', id));
+      await deleteDoc(doc(db, 'users', user!.uid, 'sermons', id));
       if (activeIdRef.current === id) {
         setActiveId(null);
         activeIdRef.current = null;
@@ -382,9 +833,30 @@ export default function SermonApp() {
     }
   };
 
+  // 📦 드래그 앤 드롭으로 설교를 다른 분류로 이동
+  const [dragOverCat, setDragOverCat] = useState<string | null>(null);
+
+  const moveSermonToCategory = async (sermonId: string, targetCatId: string) => {
+    if (!sermonId || targetCatId === currentCategory) return;
+    // 이동 직후 대기 중인 자동저장이 옛 분류로 되돌려 쓰지 않도록 취소
+    if (activeIdRef.current === sermonId && saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+    try {
+      await setDoc(
+        doc(db, 'users', user!.uid, 'sermons', sermonId),
+        { category: targetCatId, updatedAt: new Date().toISOString() },
+        { merge: true }
+      );
+      setSyncStatus(`'${getCategoryName(targetCatId)}'(으)로 이동 완료`);
+    } catch {
+      alert('설교 이동 중 오류가 발생했습니다.');
+    }
+  };
+
   const handleMultipleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (!files || files.length === 0 || !user) return;
+    if (!files || files.length === 0) return;
 
     setSyncStatus(`${files.length}개 파일 업로드 중...`);
     const today = new Date().toISOString().slice(0, 10);
@@ -394,13 +866,14 @@ export default function SermonApp() {
       const text = await file.text();
       const fileNameWithoutExt = file.name.replace(/\.[^/.]+$/, '');
 
-      await addDoc(collection(db, 'users', user.uid, 'sermons'), {
+      await addDoc(collection(db, 'users', user!.uid, 'sermons'), {
         title: fileNameWithoutExt,
         date: today,
         scripture: '',
         content: text,
         category: currentCategory,
         updatedAt: new Date().toISOString(),
+        order: -Date.now() + i,
       });
     }
 
@@ -408,63 +881,152 @@ export default function SermonApp() {
     e.target.value = '';
   };
 
-  // 형광펜 기능
+  // 목록에서 설교 위치를 한 칸 위(-1)/아래(1)로 옮긴다. 보이는 순서 그대로 order를 다시 매겨 저장.
+  const moveSermonOrder = async (id: string, dir: -1 | 1) => {
+    const from = sermons.findIndex((s) => s.id === id);
+    const to = from + dir;
+    if (from < 0 || to < 0 || to >= sermons.length) return;
+    const next = [...sermons];
+    [next[from], next[to]] = [next[to], next[from]];
+    setSermons(next.map((s, i) => ({ ...s, order: i })));
+    try {
+      await Promise.all(
+        next.map((s, i) =>
+          setDoc(doc(db, 'users', user!.uid, 'sermons', s.id), { order: i }, { merge: true })
+        )
+      );
+    } catch {
+      setSyncStatus('순서 저장 오류');
+    }
+  };
+
+  // 라이브 드래그 선택이 아직 살아있으면 그걸 쓰고, 버튼 클릭 때문에 이미
+  // 풀려버렸으면 selectionchange로 저장해 둔 마지막 드래그 범위를 대신 쓴다
+  const resolveDragRange = (editable: HTMLDivElement): Range | null => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+      const liveRange = sel.getRangeAt(0);
+      if (editable.contains(liveRange.commonAncestorContainer)) return liveRange;
+    }
+    const saved = savedRangeRef.current;
+    if (saved && editable.contains(saved.commonAncestorContainer)) return saved;
+    return null;
+  };
+
+  // 🖍️ 형광펜 적용 (선택한 범위를 <mark>로 감싼다)
+  // Range.extractContents()로 직접 자르고 붙이는 방식은 모바일 사파리의
+  // contentEditable에서 글자가 통째로 사라지는 경우가 있어서, 표 삽입과
+  // 같은 방식(execCommand insertHTML — 선택 영역을 교체)으로 맞춘다.
+  // 선택 영역의 텍스트만 뽑으면(Range.toString()) 그 안에 있던 <br> 줄바꿈이
+  // 사라져서 여러 줄이 한 줄로 합쳐지므로, 반드시 HTML(cloneContents)을 그대로 감싼다.
   const applyHighlight = (color: 'yellow' | 'green' | 'pink') => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-
-    if (start === end) {
-      alert('형광펜을 칠할 문장을 먼저 드래그해 주세요.');
+    const editable = editableRef.current;
+    if (!editable) return;
+    const range = resolveDragRange(editable);
+    if (!range || !range.toString().trim()) {
+      alert('형광펜을 칠할 문장을 마우스로 먼저 드래그(선택)해 주세요!');
       return;
     }
 
-    const selectedText = content.slice(start, end);
-    if (!selectedText.trim()) return;
+    recordHistoryBeforeChange(editable.innerHTML);
 
-    recordHistoryBeforeChange(content);
+    editable.focus();
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
 
-    const cleanText = selectedText.replace(/==([ygp]:)?/g, '').replace(/==/g, '');
-    const prefix = color === 'green' ? '==g:' : color === 'pink' ? '==p:' : '==';
-    const tagged = `${prefix}${cleanText}==`;
+    const cls = color === 'green' ? 'hl-green' : color === 'pink' ? 'hl-pink' : 'hl-yellow';
+    const tempDiv = document.createElement('div');
+    tempDiv.appendChild(range.cloneContents());
+    wrapInlineRuns(tempDiv, cls); // 줄(블록) 경계는 그대로 두고 그 안의 내용만 감싼다
 
-    const newContent = content.slice(0, start) + tagged + content.slice(end);
-    setContent(newContent);
-    saveToCloud(title, date, scripture, newContent);
+    document.execCommand('insertHTML', false, tempDiv.innerHTML);
+    savedRangeRef.current = null;
 
-    setTimeout(() => {
-      textarea.focus();
-      textarea.setSelectionRange(start, start + tagged.length);
-    }, 20);
+    commitChange();
   };
 
+  // ⚪ 형광펜 지우개 (드래그한 범위 안의 <mark>를 풀거나, 커서가 닿은 <mark> 하나를 푼다)
   const removeHighlight = () => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
+    const editable = editableRef.current;
+    if (!editable) return;
 
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
+    const dragRange = resolveDragRange(editable);
+    recordHistoryBeforeChange(editable.innerHTML);
 
-    if (start === end) {
-      alert('지우고 싶은 형광펜 글자를 드래그해 주세요.');
-      return;
+    if (dragRange) {
+      const marks = Array.from(editable.querySelectorAll('mark:not(.hl-search)')).filter((m) =>
+        dragRange.intersectsNode(m)
+      );
+      if (marks.length === 0) {
+        alert('형광펜을 지우고 싶은 문장을 드래그해 주세요.');
+        return;
+      }
+      marks.forEach(unwrapMark);
+      savedRangeRef.current = null;
+    } else {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !editable.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        alert('형광펜을 지우고 싶은 문장을 드래그하거나 형광펜 글자 사이에 커서를 놓아주세요.');
+        return;
+      }
+      let node: Node | null = sel.getRangeAt(0).startContainer;
+      let found = false;
+      while (node && node !== editable) {
+        if (node.nodeType === 1 && (node as Element).tagName === 'MARK') {
+          unwrapMark(node as Element);
+          found = true;
+          break;
+        }
+        node = node.parentNode;
+      }
+      if (!found) {
+        alert('형광펜을 지우고 싶은 문장을 드래그하거나 형광펜 글자 사이에 커서를 놓아주세요.');
+        return;
+      }
     }
 
-    recordHistoryBeforeChange(content);
-    const selectedText = content.slice(start, end);
-    const cleanText = selectedText.replace(/==([ygp]:)?/g, '').replace(/==/g, '');
-    const newContent = content.slice(0, start) + cleanText + content.slice(end);
-
-    setContent(newContent);
-    saveToCloud(title, date, scripture, newContent);
+    window.getSelection()?.removeAllRanges();
+    commitChange();
   };
 
-  // 검색 네비게이션
+  // 📊 표 삽입
+  const insertTable = () => {
+    const rowsInput = prompt('표의 행(가로줄) 개수를 입력하세요:', '3');
+    if (rowsInput === null) return;
+    const colsInput = prompt('표의 열(세로줄) 개수를 입력하세요:', '3');
+    if (colsInput === null) return;
+
+    const rows = Math.min(30, Math.max(1, parseInt(rowsInput, 10) || 3));
+    const cols = Math.min(10, Math.max(1, parseInt(colsInput, 10) || 3));
+
+    const editable = editableRef.current;
+    if (!editable) return;
+    editable.focus();
+
+    recordHistoryBeforeChange(editable.innerHTML);
+
+    let tableHtml = '<table class="sermon-table"><tbody>';
+    for (let r = 0; r < rows; r++) {
+      tableHtml += '<tr>' + '<td><br></td>'.repeat(cols) + '</tr>';
+    }
+    tableHtml += '</tbody></table><div><br></div>';
+
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && editable.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+      document.execCommand('insertHTML', false, tableHtml);
+    } else {
+      editable.insertAdjacentHTML('beforeend', tableHtml);
+    }
+
+    commitChange();
+  };
+
+  // 🔍 검색어 인덱스 (태그를 걷어낸 평문 기준 — contentEditable 텍스트 노드 순회와 오프셋이 맞음)
+  const plainContent = toPlainText(content);
   const searchMatchIndices: number[] = [];
-  if (searchQuery.trim() && content) {
-    const lowerContent = content.toLowerCase();
+  if (searchQuery.trim() && plainContent) {
+    const lowerContent = plainContent.toLowerCase();
     const lowerQ = searchQuery.toLowerCase();
     let idx = lowerContent.indexOf(lowerQ);
     while (idx !== -1) {
@@ -473,8 +1035,11 @@ export default function SermonApp() {
     }
   }
 
+  // 🔍 검색어로 이동 (DOM 텍스트 노드를 직접 찾아서 선택 + 스크롤)
   const jumpToMatch = (direction: 'next' | 'prev') => {
-    if (searchMatchIndices.length === 0 || !textareaRef.current) return;
+    const editable = editableRef.current;
+    if (searchMatchIndices.length === 0 || !editable) return;
+
     let nextIdx = 0;
     if (direction === 'next') {
       nextIdx = (currentMatchIndex + 1) % searchMatchIndices.length;
@@ -484,12 +1049,26 @@ export default function SermonApp() {
     setCurrentMatchIndex(nextIdx);
 
     const pos = searchMatchIndices[nextIdx];
-    textareaRef.current.focus();
-    textareaRef.current.setSelectionRange(pos, pos + searchQuery.length);
-    const ratio = pos / (content.length || 1);
-    textareaRef.current.scrollTop = Math.max(0, ratio * textareaRef.current.scrollHeight - 100);
+    const start = findTextNodeAndOffset(editable, pos);
+    const end = findTextNodeAndOffset(editable, pos + searchQuery.length);
+    if (!start || !end) return;
+
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+
+    const rect = range.getBoundingClientRect();
+    const containerRect = editable.getBoundingClientRect();
+    if (rect.top < containerRect.top || rect.bottom > containerRect.bottom) {
+      editable.scrollTop += rect.top - containerRect.top - editable.clientHeight / 2;
+    }
   };
 
+  // 타이머 로직
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (isTimerRunning) {
@@ -504,6 +1083,9 @@ export default function SermonApp() {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
+  const currentCategoryName = categories.find((c) => c.id === currentCategory)?.name || '분류 없음';
+
+  // 🔍 검색어 하이라이트 함수
   const highlightSearchTerm = (text: string, queryStr: string) => {
     if (!queryStr.trim() || !text) return text;
     const escaped = queryStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -514,7 +1096,10 @@ export default function SermonApp() {
       <>
         {parts.map((part, i) =>
           regex.test(part) ? (
-            <mark key={i} className="bg-amber-300 text-neutral-950 font-bold px-1 py-0.5 rounded">
+            <mark
+              key={i}
+              className="bg-amber-300 text-neutral-950 font-bold px-1 py-0.5 rounded shadow-sm"
+            >
               {part}
             </mark>
           ) : (
@@ -525,33 +1110,20 @@ export default function SermonApp() {
     );
   };
 
-  const renderFormattedSermon = (rawText: string, queryStr: string) => {
-    if (!rawText) return '작성된 원고 내용이 없습니다.';
-    const parts = rawText.split(/(==(?:[ygp]:)?[\s\S]*?==)/g);
+  const getSearchSnippet = (fullContent: string, queryStr: string) => {
+    if (!queryStr.trim() || !fullContent) return '';
+    const lowerContent = fullContent.toLowerCase();
+    const lowerQuery = queryStr.toLowerCase();
+    const idx = lowerContent.indexOf(lowerQuery);
 
-    return parts.map((part, index) => {
-      if (part.startsWith('==') && part.endsWith('==') && part.length >= 4) {
-        let markBg = 'bg-yellow-300 text-neutral-950';
-        let innerText = part.slice(2, -2);
+    if (idx === -1) return fullContent.slice(0, 70);
 
-        if (part.startsWith('==g:')) {
-          markBg = 'bg-emerald-300 text-neutral-950';
-          innerText = part.slice(4, -2);
-        } else if (part.startsWith('==p:')) {
-          markBg = 'bg-pink-300 text-neutral-950';
-          innerText = part.slice(4, -2);
-        } else if (part.startsWith('==y:')) {
-          innerText = part.slice(4, -2);
-        }
+    const start = Math.max(0, idx - 18);
+    const end = Math.min(fullContent.length, idx + queryStr.length + 45);
+    const prefix = start > 0 ? '...' : '';
+    const suffix = end < fullContent.length ? '...' : '';
 
-        return (
-          <mark key={index} className={`${markBg} font-bold px-1.5 py-0.5 rounded shadow-sm mx-0.5 inline-block`}>
-            {highlightSearchTerm(innerText, queryStr)}
-          </mark>
-        );
-      }
-      return <span key={index}>{highlightSearchTerm(part, queryStr)}</span>;
-    });
+    return prefix + fullContent.slice(start, end).replace(/\n/g, ' ') + suffix;
   };
 
   const trimmedQuery = searchQuery.trim().toLowerCase();
@@ -560,13 +1132,20 @@ export default function SermonApp() {
     : [];
   const contentMatches = trimmedQuery
     ? allSermonsForSearch.filter(
-        (s) => !s.title.toLowerCase().includes(trimmedQuery) && s.content.toLowerCase().includes(trimmedQuery)
+        (s) =>
+          !s.title.toLowerCase().includes(trimmedQuery) &&
+          toPlainText(s.content).toLowerCase().includes(trimmedQuery)
       )
     : [];
 
   const getCategoryName = (catId: string) => {
-    return DEFAULT_CATEGORIES.find((c) => c.id === catId)?.name || '기타';
+    return categories.find((c) => c.id === catId)?.name || '기타';
   };
+
+  // 🖍️ 본문 렌더러 (미리보기/강단 모드용) — 평문+마커든 HTML이든 전부 HTML로 승격해서 그린다
+  const renderedContentHtml = content
+    ? highlightHtml(ensureHtml(content), searchQuery)
+    : '작성된 원고 내용이 없습니다.';
 
   // 로딩 화면
   if (authLoading) {
@@ -617,10 +1196,10 @@ export default function SermonApp() {
     );
   }
 
-  // 강단 모드
+  // 강단 리딩 모드
   if (isPulpitMode) {
     return (
-      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col p-6">
+      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col p-6 selection:bg-yellow-500 selection:text-black">
         <header className="flex justify-between items-center border-b border-neutral-800 pb-4 w-full px-4 max-w-6xl mx-auto">
           <div className="flex items-center gap-3">
             <button
@@ -630,7 +1209,7 @@ export default function SermonApp() {
               ← 편집 모드
             </button>
             <span className="text-xs px-2.5 py-1 rounded bg-neutral-800 text-neutral-400 font-semibold">
-              {getCategoryName(currentCategory)}
+              {currentCategoryName}
             </span>
             <div className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-1 text-sm">
               <span>글자</span>
@@ -694,10 +1273,9 @@ export default function SermonApp() {
           </div>
           <div
             style={{ fontSize: `${fontSize}px`, lineHeight: 1.95 }}
-            className="whitespace-pre-wrap font-sans text-neutral-200 tracking-normal"
-          >
-            {renderFormattedSermon(content, searchQuery)}
-          </div>
+            className="font-sans text-neutral-200 tracking-normal"
+            dangerouslySetInnerHTML={{ __html: renderedContentHtml }}
+          />
         </main>
       </div>
     );
@@ -706,77 +1284,157 @@ export default function SermonApp() {
   const canUndo = historyCount.past > 0;
   const canRedo = historyCount.future > 0;
 
-  // 메인 편집 화면
+  // 편집 모드 메인 화면
   return (
     <div className="h-screen bg-neutral-100 text-neutral-900 flex flex-col overflow-hidden">
       {/* 상단 헤더 */}
       <header className="bg-white border-b border-neutral-200 px-5 py-3 flex justify-between items-center shrink-0">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 min-w-0">
+          {/* 분류/설교 목록 전체 접기 — 데스크톱 전용 (모바일은 뒤로가기로 이동) */}
           <button
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="p-2 rounded-xl border border-neutral-200 hover:bg-neutral-100 text-neutral-700 transition flex items-center gap-1.5 text-xs font-semibold"
+            className="hidden md:flex p-2 rounded-xl border border-neutral-200 hover:bg-neutral-100 text-neutral-700 transition items-center gap-1.5 text-xs font-semibold shrink-0"
+            title={isSidebarOpen ? '목록 접기' : '목록 열기'}
           >
-            <span>{isSidebarOpen ? '◀' : '▶'}</span>
-            <span className="hidden sm:inline">{isSidebarOpen ? '목록 접기' : '설교 목록'}</span>
+            <span className="text-base">{isSidebarOpen ? '◀' : '▶'}</span>
+            <span>{isSidebarOpen ? '목록 접기' : '설교 목록'}</span>
           </button>
 
-          <div>
-            <h1 className="text-lg font-black tracking-tight">설교 메모장</h1>
-            <p className={`text-[11px] font-semibold flex items-center gap-1 ${isOnline ? 'text-emerald-600' : 'text-amber-600'}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
+          <div className="shrink-0 min-w-0">
+            <h1 className="text-lg font-black tracking-tight truncate">설교 메모장</h1>
+            <p
+              className={`text-[11px] font-semibold flex items-center gap-1 ${
+                isOnline ? 'text-emerald-600' : 'text-amber-600'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                }`}
+              ></span>
               {syncStatus}
             </p>
           </div>
-
-          <div className="flex gap-1 p-1 bg-neutral-100 rounded-xl">
-            {DEFAULT_CATEGORIES.map((cat) => (
-              <button
-                key={cat.id}
-                onClick={() => {
-                  setCurrentCategory(cat.id);
-                  setActiveId(null);
-                  activeIdRef.current = null;
-                }}
-                className={`px-3 py-1.5 text-xs font-bold rounded-lg transition ${
-                  currentCategory === cat.id
-                    ? 'bg-white text-neutral-900 shadow-sm'
-                    : 'text-neutral-500 hover:text-neutral-900'
-                }`}
-              >
-                {cat.name}
-              </button>
-            ))}
-          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setIsPulpitMode(true)}
-            disabled={!activeId}
-            className="flex items-center gap-2 px-3.5 py-2 bg-neutral-900 text-white rounded-xl text-xs font-semibold hover:bg-neutral-800 transition disabled:opacity-50"
-          >
-            <span>강단 모드</span>
-            <span>→</span>
-          </button>
-          <button
-            onClick={handleLogout}
-            title={user.email || '로그아웃'}
-            className="px-3 py-2 border border-neutral-200 hover:bg-neutral-100 text-neutral-600 rounded-xl text-xs font-bold transition"
-          >
-            로그아웃
-          </button>
-        </div>
+        <button
+          onClick={() => setIsPulpitMode(true)}
+          disabled={!activeId}
+          className="flex items-center gap-2 px-4 py-2 bg-neutral-900 text-white rounded-xl text-xs sm:text-sm font-semibold hover:bg-neutral-800 transition disabled:opacity-50 shrink-0 ml-2"
+        >
+          <span>강단 읽기 모드</span>
+          <span>→</span>
+        </button>
+        <button
+          onClick={handleLogout}
+          title={user.email || '로그아웃'}
+          className="px-3 py-2 border border-neutral-200 hover:bg-neutral-100 text-neutral-600 rounded-xl text-xs font-bold transition shrink-0 ml-2"
+        >
+          로그아웃
+        </button>
       </header>
 
-      {/* 본문 레이아웃 */}
+      {/* 본문 레이아웃: 분류 목록 → 설교 목록 → 편집창 (모바일은 한 단씩, 데스크톱은 한 화면에) */}
       <div className="flex-1 flex w-full p-4 gap-4 overflow-hidden">
-        {/* 사이드바 */}
-        {isSidebarOpen && (
-          <aside className="w-80 shrink-0 bg-white border border-neutral-200 rounded-2xl flex flex-col p-4 gap-3 h-full shadow-sm">
+        {/* 1단: 분류 목록 */}
+        <aside
+          className={
+            (mobilePane === 'categories' ? 'flex' : 'hidden') +
+            ' ' +
+            (isSidebarOpen ? 'md:flex' : 'md:hidden') +
+            ' w-full md:w-56 shrink-0 bg-white border border-neutral-200 rounded-2xl flex-col p-3 gap-1.5 h-full shadow-sm overflow-y-auto'
+          }
+        >
+          <p className="text-[11px] font-bold text-neutral-400 px-2 pb-1">설교 분류</p>
+          {categories.map((cat) => (
+            <div
+              key={cat.id}
+              onClick={() => {
+                setCurrentCategory(cat.id);
+                setActiveId(null);
+                activeIdRef.current = null;
+                setMobilePane('sermons');
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOverCat(cat.id);
+              }}
+              onDragLeave={() => setDragOverCat(null)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOverCat(null);
+                moveSermonToCategory(e.dataTransfer.getData('text/plain'), cat.id);
+              }}
+              className={`group relative flex items-center justify-between gap-1.5 px-3 py-2.5 text-sm font-bold rounded-xl cursor-pointer transition select-none ${
+                dragOverCat === cat.id
+                  ? 'bg-yellow-200 text-neutral-900 ring-2 ring-yellow-400'
+                  : currentCategory === cat.id
+                  ? 'bg-neutral-900 text-white shadow-sm'
+                  : 'text-neutral-600 hover:bg-neutral-100'
+              }`}
+            >
+              <span className="truncate">{cat.name}</span>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={(e) => handleRenameCategory(cat, e)}
+                  className={`text-[10px] rounded-full w-5 h-5 flex items-center justify-center transition opacity-60 group-hover:opacity-100 ${
+                    currentCategory === cat.id ? 'hover:bg-white/20' : 'hover:bg-neutral-200'
+                  }`}
+                  title={`${cat.name} 이름 변경`}
+                >
+                  ✏️
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => handleDeleteCategory(cat, e)}
+                  className={`text-[10px] rounded-full w-5 h-5 flex items-center justify-center transition opacity-60 group-hover:opacity-100 ${
+                    currentCategory === cat.id ? 'hover:bg-white/20' : 'hover:bg-neutral-200 hover:text-red-600'
+                  }`}
+                  title={`${cat.name} 분류 삭제`}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={handleAddCategory}
+            className="px-3 py-2.5 text-sm font-bold text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-xl transition flex items-center gap-1.5 border border-dashed border-neutral-300"
+          >
+            <span>+</span>
+            <span>분류 추가</span>
+          </button>
+        </aside>
+
+        {/* 2단: 현재 분류의 설교 목록 (검색 중이면 전체 검색 결과) */}
+        <aside
+          className={
+            (mobilePane === 'sermons' ? 'flex' : 'hidden') +
+            ' ' +
+            (isSidebarOpen ? 'md:flex' : 'md:hidden') +
+            ' w-full md:w-80 shrink-0 bg-white border border-neutral-200 rounded-2xl flex-col p-4 gap-3 h-full shadow-sm'
+          }
+        >
+          <button
+            type="button"
+            onClick={() => setMobilePane('categories')}
+            className="md:hidden flex items-center gap-1 text-xs font-bold text-neutral-500 hover:text-neutral-900 shrink-0 -mt-1 -ml-1 px-1 py-1"
+          >
+            <span>←</span>
+            <span>분류 목록</span>
+          </button>
+
+          <p className="hidden md:block text-[11px] font-bold text-neutral-400 px-1 shrink-0 truncate">
+            {currentCategoryName}
+          </p>
+
+            {/* 🔍 통합 검색창 */}
             <div className="relative shrink-0">
               <input
                 type="text"
-                placeholder="내 설교 검색 (제목/본문)"
+                placeholder="전체 폴더 검색 (제목/본문)"
                 value={searchQuery}
                 onChange={(e) => {
                   setSearchQuery(e.target.value);
@@ -785,6 +1443,14 @@ export default function SermonApp() {
                 className="w-full text-xs font-medium bg-neutral-50 border border-neutral-200 rounded-xl px-3 py-2.5 pl-8 focus:outline-none focus:ring-2 focus:ring-neutral-900"
               />
               <span className="absolute left-2.5 top-2.5 text-neutral-400 text-xs">🔍</span>
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-2 text-xs text-neutral-400 hover:text-neutral-700 px-1"
+                >
+                  ✕
+                </button>
+              )}
             </div>
 
             <div className="flex gap-2 shrink-0">
@@ -799,7 +1465,7 @@ export default function SermonApp() {
                 className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-xs font-bold rounded-xl border border-neutral-200 transition"
                 title="텍스트 파일 여러 개 일괄 불러오기"
               >
-                파일 열기
+                파일 일괄 열기
               </button>
               <input
                 type="file"
@@ -811,71 +1477,140 @@ export default function SermonApp() {
               />
             </div>
 
-            {/* 설교 목록 / 검색 결과 */}
+            {/* 목록 또는 검색 결과 */}
             <div className="flex-1 overflow-y-auto flex flex-col gap-2 pr-1">
               {searchQuery.trim() !== '' ? (
-                <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-4">
                   <div>
                     <p className="text-[11px] font-bold text-neutral-400 mb-1 px-1">
-                      제목 매칭 ({titleMatches.length})
+                      📌 제목 매칭 ({titleMatches.length})
                     </p>
-                    {titleMatches.map((s) => (
-                      <div
-                        key={s.id}
-                        onClick={() => selectSermon(s)}
-                        className={`p-2.5 rounded-xl border text-left cursor-pointer transition mb-1.5 ${
-                          activeId === s.id
-                            ? 'bg-neutral-900 text-white border-neutral-900'
-                            : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200'
-                        }`}
-                      >
-                        <p className="font-bold text-xs truncate">{highlightSearchTerm(s.title, searchQuery)}</p>
-                      </div>
-                    ))}
+                    {titleMatches.length === 0 ? (
+                      <p className="text-xs text-neutral-400 px-1 py-1">일치하는 제목 없음</p>
+                    ) : (
+                      titleMatches.map((s) => (
+                        <div
+                          key={s.id}
+                          onClick={() => selectSermon(s)}
+                          className={`p-2.5 rounded-xl border text-left cursor-pointer transition mb-1.5 ${
+                            activeId === s.id
+                              ? 'bg-neutral-900 text-white border-neutral-900'
+                              : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200 text-neutral-800'
+                          }`}
+                        >
+                          <div className="flex justify-between items-center text-[10px] text-yellow-600 font-semibold mb-0.5">
+                            <span>[{getCategoryName(s.category)}]</span>
+                            <span>{s.date}</span>
+                          </div>
+                          <p className="font-bold text-xs truncate">
+                            {highlightSearchTerm(s.title, searchQuery)}
+                          </p>
+                        </div>
+                      ))
+                    )}
                   </div>
+
                   <div>
                     <p className="text-[11px] font-bold text-neutral-400 mb-1 px-1">
-                      본문 매칭 ({contentMatches.length})
+                      📄 본문 매칭 ({contentMatches.length})
                     </p>
-                    {contentMatches.map((s) => (
-                      <div
-                        key={s.id}
-                        onClick={() => selectSermon(s)}
-                        className={`p-2.5 rounded-xl border text-left cursor-pointer transition mb-1.5 ${
-                          activeId === s.id
-                            ? 'bg-neutral-900 text-white border-neutral-900'
-                            : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200'
-                        }`}
-                      >
-                        <p className="font-bold text-xs truncate">{s.title}</p>
-                      </div>
-                    ))}
+                    {contentMatches.length === 0 ? (
+                      <p className="text-xs text-neutral-400 px-1 py-1">일치하는 본문 없음</p>
+                    ) : (
+                      contentMatches.map((s) => (
+                        <div
+                          key={s.id}
+                          onClick={() => selectSermon(s)}
+                          className={`p-2.5 rounded-xl border text-left cursor-pointer transition mb-1.5 ${
+                            activeId === s.id
+                              ? 'bg-neutral-900 text-white border-neutral-900'
+                              : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200 text-neutral-800'
+                          }`}
+                        >
+                          <div className="flex justify-between items-center text-[10px] text-blue-600 font-semibold mb-0.5">
+                            <span>[{getCategoryName(s.category)}]</span>
+                            <span>{s.date}</span>
+                          </div>
+                          <p className="font-bold text-xs truncate">{s.title}</p>
+                          <p className="text-[11px] text-neutral-500 truncate mt-0.5 leading-snug">
+                            {highlightSearchTerm(
+                              getSearchSnippet(toPlainText(s.content), searchQuery),
+                              searchQuery
+                            )}
+                          </p>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
               ) : sermons.length === 0 ? (
                 <div className="text-center text-xs text-neutral-400 py-10">
-                  작성된 설교가 없습니다.
+                  작성된 설교가 없습니다. <br /> 새 설교나 파일 열기를 눌러보세요.
                 </div>
               ) : (
                 sermons.map((s) => (
                   <div
                     key={s.id}
+                    draggable
+                    onDragStart={(e) => e.dataTransfer.setData('text/plain', s.id)}
                     onClick={() => selectSermon(s)}
+                    title="위쪽 분류 탭으로 끌어다 놓으면 해당 분류로 이동합니다"
                     className={`p-3 rounded-xl border text-left cursor-pointer transition flex justify-between items-start group ${
                       activeId === s.id
-                        ? 'bg-neutral-900 text-white border-neutral-900'
-                        : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200'
+                        ? 'bg-neutral-900 text-white border-neutral-900 shadow-sm'
+                        : 'bg-neutral-50 hover:bg-neutral-100 border-neutral-200 text-neutral-800'
                     }`}
                   >
                     <div className="flex-1 min-w-0 pr-2">
                       <p className="font-bold text-sm truncate">{s.title || '제목 없음'}</p>
-                      <p className="text-xs text-neutral-400 truncate mt-1">
-                        {s.date} {s.scripture && `| ${s.scripture}`}
-                      </p>
+                      <div className="flex items-center gap-2 text-xs truncate mt-1">
+                        {s.date && (
+                          <span
+                            className={`font-mono ${
+                              activeId === s.id ? 'text-neutral-400' : 'text-neutral-500'
+                            }`}
+                          >
+                            {s.date}
+                          </span>
+                        )}
+                        {s.scripture && (
+                          <span
+                            className={`truncate ${
+                              activeId === s.id ? 'text-yellow-400' : 'text-neutral-500'
+                            }`}
+                          >
+                            {s.scripture}
+                          </span>
+                        )}
+                      </div>
                     </div>
+                    {activeId === s.id && (
+                      <div className="flex flex-col shrink-0 mr-1">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            moveSermonOrder(s.id, -1);
+                          }}
+                          title="위로"
+                          className="text-[10px] leading-none px-1.5 py-1 rounded hover:bg-neutral-700"
+                        >
+                          ▲
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            moveSermonOrder(s.id, 1);
+                          }}
+                          title="아래로"
+                          className="text-[10px] leading-none px-1.5 py-1 rounded hover:bg-neutral-700"
+                        >
+                          ▼
+                        </button>
+                      </div>
+                    )}
                     <button
                       onClick={(e) => deleteSermon(s.id, e)}
-                      className="opacity-0 group-hover:opacity-100 text-xs px-1.5 py-0.5 rounded hover:bg-red-500 hover:text-white transition"
+                      className="opacity-0 group-hover:opacity-100 text-xs px-1.5 py-0.5 rounded hover:bg-red-500 hover:text-white transition text-neutral-400"
                     >
                       ✕
                     </button>
@@ -883,120 +1618,228 @@ export default function SermonApp() {
                 ))
               )}
             </div>
-          </aside>
-        )}
+        </aside>
 
-        {/* 에디터 메인 */}
-        <main className="flex-1 flex flex-col gap-3 h-full min-w-0">
+        {/* 3단: 편집창 */}
+        <main
+          className={
+            (mobilePane === 'editor' ? 'flex' : 'hidden') + ' md:flex flex-1 flex-col gap-3 h-full min-w-0'
+          }
+        >
           {activeId ? (
             <>
-              <input
-                type="text"
-                placeholder="설교 제목"
-                value={title}
-                onChange={(e) => {
-                  setTitle(e.target.value);
-                  saveToCloud(e.target.value, date, scripture, content);
-                }}
-                className="w-full text-xl font-bold bg-white border border-neutral-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-neutral-900 shrink-0"
-              />
+              <button
+                type="button"
+                onClick={() => setMobilePane('sermons')}
+                className="md:hidden flex items-center gap-1 text-xs font-bold text-neutral-500 hover:text-neutral-900 shrink-0 px-1"
+              >
+                <span>←</span>
+                <span>설교 목록</span>
+              </button>
 
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 shrink-0">
-                <input
-                  type="text"
-                  placeholder="설교 날짜 (예: 2026.09.20)"
-                  value={date}
-                  onChange={(e) => {
-                    setDate(e.target.value);
-                    saveToCloud(title, e.target.value, scripture, content);
-                  }}
-                  className="w-full text-sm font-medium bg-white border border-neutral-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-neutral-900"
-                />
-                <input
-                  type="text"
-                  placeholder="본문 구절 (예: 로마서 8:1-2)"
-                  value={scripture}
-                  onChange={(e) => {
-                    setScripture(e.target.value);
-                    saveToCloud(title, date, e.target.value, content);
-                  }}
-                  className="w-full md:col-span-3 text-sm font-medium bg-white border border-neutral-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-neutral-900"
-                />
-              </div>
+              {/* 제목/날짜/본문 구절 — 본문을 아래로 스크롤하면 숨고, 위로 올리면 다시 보인다 */}
+              {showMetaFields && (
+                <>
+                  {/* 제목 입력 */}
+                  <input
+                    type="text"
+                    placeholder="설교 제목"
+                    value={title}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setTitle(val);
+                      saveToCloud(activeIdRef.current, val, date, scripture, content);
+                    }}
+                    className="w-full text-xl font-bold bg-white border border-neutral-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-neutral-900 shadow-sm shrink-0"
+                  />
+
+                  {/* 날짜 및 본문 */}
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 shrink-0">
+                    <input
+                      type="text"
+                      placeholder="설교 날짜 (예: 2026.09.20)"
+                      value={date}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setDate(val);
+                        saveToCloud(activeIdRef.current, title, val, scripture, content);
+                      }}
+                      className="w-full text-sm font-medium bg-white border border-neutral-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-neutral-900 shadow-sm"
+                    />
+                    <input
+                      type="text"
+                      placeholder="본문 구절 (예: 로마서 8:1-2)"
+                      value={scripture}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setScripture(val);
+                        saveToCloud(activeIdRef.current, title, date, val, content);
+                      }}
+                      className="w-full md:col-span-3 text-sm font-medium bg-white border border-neutral-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-neutral-900 shadow-sm"
+                    />
+                  </div>
+                </>
+              )}
 
               {/* 툴바 */}
               <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 shrink-0 bg-white border border-neutral-200 rounded-xl shadow-sm">
                 <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={handleUndo}
-                    disabled={!canUndo}
-                    className="px-2.5 py-1 rounded-lg text-xs font-bold bg-neutral-100 hover:bg-neutral-200 disabled:opacity-30"
-                  >
-                    ↶ 되돌리기
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRedo}
-                    disabled={!canRedo}
-                    className="px-2.5 py-1 rounded-lg text-xs font-bold bg-neutral-100 hover:bg-neutral-200 disabled:opacity-30"
-                  >
-                    ↷ 다시 실행
-                  </button>
-                  <span className="text-xs font-bold text-neutral-400 ml-2">형광펜:</span>
+                  {/* 되돌리기 & 다시 실행 */}
+                  <div className="flex items-center gap-1 mr-1 border-r border-neutral-200 pr-2">
+                    <button
+                      type="button"
+                      onClick={handleUndo}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer ${
+                        canUndo
+                          ? 'bg-neutral-800 text-white hover:bg-neutral-700 shadow-sm'
+                          : 'bg-neutral-100 text-neutral-400 hover:bg-neutral-200'
+                      }`}
+                      title="되돌리기 (Cmd+Z / Ctrl+Z)"
+                    >
+                      <span className="text-sm">↶</span>
+                      <span>되돌리기</span>
+                      {canUndo && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 ml-0.5 animate-pulse"></span>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleRedo}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer ${
+                        canRedo
+                          ? 'bg-neutral-800 text-white hover:bg-neutral-700 shadow-sm'
+                          : 'bg-neutral-100 text-neutral-400 hover:bg-neutral-200'
+                      }`}
+                      title="다시 실행 (Cmd+Shift+Z / Ctrl+Y)"
+                    >
+                      <span className="text-sm">↷</span>
+                      <span>다시 실행</span>
+                      {canRedo && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 ml-0.5 animate-pulse"></span>
+                      )}
+                    </button>
+                  </div>
+
+                  <span className="text-xs font-bold text-neutral-500 mr-1">형광펜:</span>
+
                   <button
                     type="button"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyHighlight('yellow')}
-                    className="px-2 py-1 bg-yellow-100 hover:bg-yellow-200 text-yellow-900 rounded-lg text-xs font-bold"
+                    className="px-2.5 py-1 bg-yellow-100 hover:bg-yellow-200 text-yellow-900 border border-yellow-300 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                    title="노란색 형광펜"
                   >
-                    🟡 노랑
+                    <span>🟡</span>
+                    <span>노랑</span>
                   </button>
+
                   <button
                     type="button"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyHighlight('green')}
-                    className="px-2 py-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 rounded-lg text-xs font-bold"
+                    className="px-2.5 py-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 border border-emerald-300 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                    title="초록색 형광펜"
                   >
-                    🟢 초록
+                    <span>🟢</span>
+                    <span>초록</span>
                   </button>
+
                   <button
                     type="button"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyHighlight('pink')}
-                    className="px-2 py-1 bg-pink-100 hover:bg-pink-200 text-pink-900 rounded-lg text-xs font-bold"
+                    className="px-2.5 py-1 bg-pink-100 hover:bg-pink-200 text-pink-900 border border-pink-300 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                    title="분홍색 형광펜"
                   >
-                    🩷 분홍
+                    <span>🩷</span>
+                    <span>분홍</span>
                   </button>
+
                   <button
                     type="button"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={removeHighlight}
-                    className="px-2 py-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-lg text-xs font-bold"
+                    className="px-2.5 py-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 border border-neutral-300 rounded-lg text-xs font-bold transition flex items-center gap-1 ml-1"
+                    title="형광펜 지우기"
                   >
-                    ⚪ 지우개
+                    <span>⚪</span>
+                    <span>지우개</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={insertTable}
+                    className="px-2.5 py-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 border border-neutral-300 rounded-lg text-xs font-bold transition flex items-center gap-1 ml-1"
+                    title="표 삽입"
+                  >
+                    <span>📊</span>
+                    <span>표 삽입</span>
                   </button>
                 </div>
 
                 <div className="flex items-center gap-2">
+                  {searchQuery.trim() && (
+                    <div className="flex items-center gap-1 bg-amber-50 border border-amber-300 text-amber-900 px-2.5 py-0.5 rounded-lg text-xs font-bold">
+                      <span>본문 내 {searchMatchIndices.length}개 발견</span>
+                      {searchMatchIndices.length > 0 && (
+                        <div className="flex items-center gap-0.5 ml-1">
+                          <button
+                            type="button"
+                            onClick={() => jumpToMatch('prev')}
+                            className="px-1.5 py-0.5 bg-amber-200 hover:bg-amber-300 rounded text-[10px]"
+                          >
+                            ▲
+                          </button>
+                          <span className="text-[10px] text-amber-800 px-0.5">
+                            {currentMatchIndex + 1}/{searchMatchIndices.length}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => jumpToMatch('next')}
+                            className="px-1.5 py-0.5 bg-amber-200 hover:bg-amber-300 rounded text-[10px]"
+                          >
+                            ▼
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="flex p-0.5 bg-neutral-100 rounded-lg border border-neutral-200 text-xs font-bold">
                     <button
+                      type="button"
                       onClick={() => setViewMode('edit')}
-                      className={`px-2 py-1 rounded-md ${viewMode === 'edit' ? 'bg-white shadow-sm' : 'text-neutral-500'}`}
+                      className={`px-2 py-1 rounded-md transition ${
+                        viewMode === 'edit'
+                          ? 'bg-white text-neutral-900 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
                     >
-                      수정만
+                      ✏️ 수정만
                     </button>
                     <button
+                      type="button"
                       onClick={() => setViewMode('split')}
-                      className={`px-2 py-1 rounded-md ${viewMode === 'split' ? 'bg-white shadow-sm' : 'text-neutral-500'}`}
+                      className={`px-2 py-1 rounded-md transition ${
+                        viewMode === 'split'
+                          ? 'bg-white text-neutral-900 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
                     >
-                      나란히
+                      📑 나란히 (추천)
                     </button>
                     <button
+                      type="button"
                       onClick={() => setViewMode('preview')}
-                      className={`px-2 py-1 rounded-md ${viewMode === 'preview' ? 'bg-white shadow-sm' : 'text-neutral-500'}`}
+                      className={`px-2 py-1 rounded-md transition ${
+                        viewMode === 'preview'
+                          ? 'bg-white text-neutral-900 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
                     >
-                      보기만
+                      👁️ 보기만
                     </button>
                   </div>
                 </div>
@@ -1005,27 +1848,52 @@ export default function SermonApp() {
               {/* 본문 에디터 */}
               <div className="flex-1 flex gap-3 h-full min-h-0">
                 {(viewMode === 'edit' || viewMode === 'split') && (
-                  <div className="flex-1 flex flex-col h-full bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                    <textarea
-                      ref={textareaRef}
-                      placeholder="설교 원고를 작성하세요..."
-                      value={content}
-                      onChange={(e) => handleContentChange(e.target.value)}
-                      className="w-full h-full p-5 bg-white text-neutral-900 text-base leading-relaxed resize-none focus:outline-none overflow-y-auto"
+                  <div className="flex-1 flex flex-col h-full bg-white border border-neutral-200 rounded-xl shadow-sm overflow-hidden">
+                    <div
+                      ref={editableRef}
+                      contentEditable
+                      suppressContentEditableWarning
+                      data-placeholder="설교 원고를 작성하세요... (문장을 드래그하고 위의 형광펜 버튼을 누르면 강조됩니다)"
+                      onInput={handleEditableInput}
+                      onScroll={handleEditorScroll}
+                      onKeyDown={(e) => {
+                        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+                          e.preventDefault();
+                          if (e.shiftKey) {
+                            handleRedo();
+                          } else {
+                            handleUndo();
+                          }
+                        } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
+                          e.preventDefault();
+                          handleRedo();
+                        }
+                      }}
+                      className="sermon-editor-area w-full h-full p-5 bg-white text-neutral-900 font-sans text-base leading-relaxed break-words overflow-y-auto focus:outline-none"
                     />
                   </div>
                 )}
+
                 {(viewMode === 'preview' || viewMode === 'split') && (
-                  <div className="flex-1 flex flex-col h-full bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                    <div className="flex-1 p-5 overflow-y-auto text-base leading-relaxed whitespace-pre-wrap break-words">
-                      {renderFormattedSermon(content, searchQuery)}
+                  <div className="flex-1 flex flex-col h-full bg-white border border-neutral-200 rounded-xl shadow-sm overflow-hidden">
+                    <div className="px-4 py-2 border-b border-neutral-100 bg-neutral-50 text-[11px] font-bold text-neutral-500 flex justify-between items-center">
+                      <span>형광펜 & 검색 실시간 뷰어</span>
+                      {searchQuery.trim() && (
+                        <span className="text-amber-600 font-semibold">
+                          검색어 '{searchQuery}' 강조 중
+                        </span>
+                      )}
                     </div>
+                    <div
+                      className="flex-1 p-5 overflow-y-auto text-base leading-relaxed font-sans text-neutral-800 break-words"
+                      dangerouslySetInnerHTML={{ __html: renderedContentHtml }}
+                    />
                   </div>
                 )}
               </div>
             </>
           ) : (
-            <div className="flex-1 bg-white border border-neutral-200 rounded-2xl flex items-center justify-center text-neutral-400 text-sm">
+            <div className="flex-1 bg-white border border-neutral-200 rounded-2xl flex items-center justify-center text-neutral-400 text-sm shadow-sm">
               왼쪽에서 설교를 선택하거나 [+ 새 설교 작성]을 눌러주세요.
             </div>
           )}
