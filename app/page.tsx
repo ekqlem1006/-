@@ -205,6 +205,8 @@ export default function SermonApp() {
 
   // 본문을 아래로 스크롤하면 제목/날짜/본문 구절 칸을 숨겨서 쓰는 공간을 넓혀준다
   const [showMetaFields, setShowMetaFields] = useState(true);
+  const showMetaRef = useRef(true);
+  const metaLockUntilRef = useRef(0);
   const lastScrollTopRef = useRef(0);
   const scrollDebounceRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -341,6 +343,7 @@ export default function SermonApp() {
     }
     if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
     setShowMetaFields(true);
+    showMetaRef.current = true;
     lastScrollTopRef.current = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, viewMode, isPulpitMode]);
@@ -354,12 +357,15 @@ export default function SermonApp() {
     if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
     scrollDebounceRef.current = setTimeout(() => {
       const last = lastScrollTopRef.current;
-      if (top <= 4) {
-        setShowMetaFields(true);
-      } else if (top > last + 4) {
-        setShowMetaFields(false);
-      } else if (top < last - 4) {
-        setShowMetaFields(true);
+      // 칸이 숨겨지거나 나타나면 편집창 높이가 바뀌면서 스크롤 위치가 저절로 밀리고, 그 스크롤을
+      // 다시 사용자 동작으로 오해해 칸이 계속 켜졌다 꺼지는(깜빡임) 문제가 있었다. 전환 직후엔 무시한다.
+      if (Date.now() >= metaLockUntilRef.current) {
+        const next = top <= 4 ? true : top > last + 4 ? false : top < last - 4 ? true : null;
+        if (next !== null && next !== showMetaRef.current) {
+          metaLockUntilRef.current = Date.now() + 700;
+          showMetaRef.current = next;
+          setShowMetaFields(next);
+        }
       }
       lastScrollTopRef.current = top;
     }, 120);
