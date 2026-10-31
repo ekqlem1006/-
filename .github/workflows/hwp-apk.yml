@@ -1,0 +1,54 @@
+name: HWP 뷰어 APK 빌드
+
+on:
+  push:
+    paths: ["hwp-viewer/**", ".github/workflows/hwp-apk.yml"]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hwp-viewer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hwp-viewer/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - run: npm run build
+      - run: npx cap add android
+      - name: .hwp/.hwpx 파일 연결(intent-filter) 추가
+        run: |
+          python3 - <<'PY'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          f = """
+              <intent-filter>
+                  <action android:name="android.intent.action.VIEW" />
+                  <category android:name="android.intent.category.DEFAULT" />
+                  <data android:scheme="content" />
+                  <data android:scheme="file" />
+                  <data android:mimeType="application/x-hwp" />
+                  <data android:mimeType="application/haansofthwp" />
+                  <data android:mimeType="application/vnd.hancom.hwp" />
+                  <data android:mimeType="application/hwp+zip" />
+              </intent-filter>
+          """
+          s = s.replace("</activity>", f + "</activity>", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+      - run: npx cap sync android
+      - run: ./gradlew assembleDebug
+        working-directory: hwp-viewer/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hwp-viewer-apk
+          path: hwp-viewer/android/app/build/outputs/apk/debug/app-debug.apk
