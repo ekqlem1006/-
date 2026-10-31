@@ -5,6 +5,9 @@ on:
     paths: ["hwp-viewer/**", ".github/workflows/hwp-apk.yml"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -52,3 +55,10 @@ jobs:
         with:
           name: hwp-viewer-apk
           path: hwp-viewer/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: 릴리스에 APK 게시 (폰에서 바로 받을 수 있게)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete hwp-viewer-latest --yes --cleanup-tag || true
+          gh release create hwp-viewer-latest android/app/build/outputs/apk/debug/app-debug.apk \
+            --title "HWP 뷰어 APK (최신)" --notes "app-debug.apk 를 받아 설치하세요." --prerelease --target "$GITHUB_SHA"
