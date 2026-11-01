@@ -25,6 +25,14 @@ function showError(e: unknown) {
   view.innerHTML = `<p class="err">열 수 없는 파일입니다: ${e instanceof Error ? e.message : String(e)}</p>`;
 }
 
+// hwp.js 는 용지 실제 크기(A4 약 794px)로 그려서 폰 화면보다 넓다. 화면 폭에 맞춰 줄인다.
+function fitPages(host: HTMLElement) {
+  const pages = Array.from(host.querySelectorAll<HTMLElement>("[data-page-number]")).filter((e) => e.parentElement?.parentElement?.parentElement === host);
+  if (!pages.length) return;
+  const scale = (view.clientWidth - 16 - 48) / Math.max(...pages.map((p) => p.offsetWidth));
+  if (scale < 1) pages.forEach((p) => ((p.style as CSSStyleDeclaration & { zoom: string }).zoom = String(scale)));
+}
+
 async function openData(name: string, data: Uint8Array) {
   baseName = name.replace(/\.[^.]+$/, "");
   nameEl.textContent = name;
@@ -41,6 +49,7 @@ async function openData(name: string, data: Uint8Array) {
       const host = document.createElement("div");
       view.appendChild(host);
       new Viewer(host, data, { type: "array" });
+      fitPages(host);
     }
     viewerEl = view.firstElementChild as HTMLElement;
     [modeBtn, txtBtn, docxBtn].forEach((b) => (b.hidden = false));

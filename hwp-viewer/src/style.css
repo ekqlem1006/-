@@ -1,9 +1,9 @@
 :root { color-scheme: light dark; }
 body { margin: 0; font-family: system-ui, sans-serif; }
-#bar { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px; background: #1f2937; color: #fff; }
+#bar { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px; padding-top: calc(8px + var(--safe-area-inset-top, 0px)); background: #1f2937; color: #fff; }
 #name { flex: 1; min-width: 120px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .btn { padding: 6px 12px; border: 0; border-radius: 6px; background: #3b82f6; color: #fff; font-size: 14px; cursor: pointer; }
-#view { padding: 8px; overflow: auto; background: #6b7280; min-height: calc(100vh - 56px); }
+#view { padding: 8px; overflow: auto; background: #6b7280; min-height: 60vh; padding-bottom: calc(8px + var(--safe-area-inset-bottom, 0px)); }
 .doc { background: #fff; color: #111; max-width: 800px; margin: 0 auto; padding: 24px; line-height: 1.7; }
 .doc p { margin: 0 0 .6em; white-space: pre-wrap; word-break: break-word; }
 .doc table { border-collapse: collapse; margin: .6em 0; width: 100%; }
