@@ -15,7 +15,18 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  writeBatch,
 } from 'firebase/firestore';
+import {
+  DEFAULT_RULES,
+  PlannerSettings,
+  Rule,
+  addDays,
+  fromKey,
+  instancePrefix,
+  planGeneration,
+  toKey,
+} from './recurring';
 
 interface Todo {
   id: string;
@@ -26,23 +37,6 @@ interface Todo {
 }
 
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
-
-function toKey(d: Date): string {
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${d.getFullYear()}-${m}-${day}`;
-}
-
-function fromKey(key: string): Date {
-  const [y, m, d] = key.split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function addDays(key: string, n: number): string {
-  const d = fromKey(key);
-  d.setDate(d.getDate() + n);
-  return toKey(d);
-}
 
 function weekOf(key: string): string[] {
   const start = addDays(key, -fromKey(key).getDay());
@@ -78,6 +72,18 @@ export default function PlannerApp() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // 반복 할 일 설정 (users/{uid}/settings/planner). exists=false 는 "서버에 아직 문서가 없음".
+  const [settingsSnap, setSettingsSnap] = useState<{
+    uid: string;
+    exists: boolean;
+    fromServer: boolean;
+    value: PlannerSettings;
+  } | null>(null);
+  const [showRecurring, setShowRecurring] = useState(false);
+  const [ruleText, setRuleText] = useState('');
+  const [ruleWeekday, setRuleWeekday] = useState(3);
+  const [ruleByMonth, setRuleByMonth] = useState(false);
 
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
@@ -125,6 +131,68 @@ export default function PlannerApp() {
 
   const loaded = !!user && data?.uid === user.uid;
   const todos = useMemo(() => (loaded && data ? data.todos : []), [loaded, data]);
+
+  // 반복 설정 실시간 동기화
+  useEffect(() => {
+    if (!user) return;
+    const uid = user.uid;
+    return onSnapshot(
+      doc(db, 'users', uid, 'settings', 'planner'),
+      { includeMetadataChanges: true },
+      (snap) => {
+        const raw = snap.data() as Partial<PlannerSettings> | undefined;
+        setSettingsSnap({
+          uid,
+          exists: snap.exists(),
+          fromServer: !snap.metadata.fromCache,
+          value: { rules: raw?.rules ?? [], generatedUntil: raw?.generatedUntil ?? {} },
+        });
+      },
+      (err) => {
+        console.error('반복 설정 동기화 에러:', err);
+        setSyncError(err.code || err.message);
+      }
+    );
+  }, [user]);
+
+  const settings = user && settingsSnap?.uid === user.uid ? settingsSnap : null;
+  const rules = settings?.value.rules ?? [];
+
+  // 반복 할 일 만들기. 서버에서 확인된 설정일 때만 돈다 — 캐시만 보고 돌리면
+  // "문서 없음"으로 착각해 기본 규칙을 덮어쓰거나, 지운 할 일을 다시 만들 수 있다.
+  useEffect(() => {
+    if (!user || !loaded || !settings?.fromServer) return;
+    const uid = user.uid;
+    const settingsRef = doc(db, 'users', uid, 'settings', 'planner');
+    const onError = (err: { code?: string; message?: string }) => {
+      console.error('반복 할 일 생성 에러:', err);
+      setSyncError(err.code || err.message || '알 수 없는 오류');
+    };
+
+    if (!settings.exists) {
+      // 처음 한 번만 기본 규칙을 넣는다. 이후에는 지워도 다시 생기지 않는다.
+      setDoc(settingsRef, { rules: DEFAULT_RULES, generatedUntil: {} }).catch(onError);
+      return;
+    }
+    const plan = planGeneration(settings.value, today);
+    if (!plan) return;
+    const existing = new Set(todos.map((t) => t.id));
+    const batch = writeBatch(db);
+    const now = Date.now();
+    plan.todos.forEach((t, i) => {
+      if (existing.has(t.id)) return;
+      batch.set(doc(db, 'users', uid, 'todos', t.id), {
+        text: t.text,
+        date: t.date,
+        done: false,
+        createdAt: now + i,
+      });
+    });
+    batch.set(settingsRef, plan.settings);
+    batch.commit().catch(onError);
+    // todos 는 "이미 있는 문서 건너뛰기"에만 쓰므로, 목록이 바뀔 때마다 다시 돌 필요는 없다
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, loaded, settings, today]);
 
   // 첫 클릭 때 Firebase가 로그인 준비(iframe 로드)를 하느라 시간이 걸리면 브라우저가
   // "사용자가 누른 것이 아닌 팝업"으로 보고 막아 버린다. 로그인 화면이 뜰 때 미리 준비해 둔다.
@@ -185,6 +253,71 @@ export default function PlannerApp() {
   const toggle = (t: Todo) => updateDoc(todoRef(t.id), { done: !t.done }).catch(fail);
   const remove = (t: Todo) => deleteDoc(todoRef(t.id)).catch(fail);
   const moveTo = (t: Todo, date: string) => updateDoc(todoRef(t.id), { date }).catch(fail);
+
+  // ── 반복 규칙 편집 ──
+  const saveRules = (next: Rule[]) => {
+    if (!user || !settings) return;
+    setDoc(doc(db, 'users', user.uid, 'settings', 'planner'), {
+      rules: next,
+      generatedUntil: settings.value.generatedUntil,
+    }).catch(fail);
+  };
+
+  // 규칙에서 만들어진 할 일 중 아직 안 끝낸 것만 지운다 (끝낸 기록은 남긴다)
+  const removeInstances = (prefix: string, fromDate: string) => {
+    if (!user) return;
+    const targets = todos.filter((t) => t.id.startsWith(prefix) && !t.done && t.date >= fromDate);
+    if (targets.length === 0) return;
+    const batch = writeBatch(db);
+    targets.forEach((t) => batch.delete(todoRef(t.id)));
+    batch.commit().catch(fail);
+  };
+
+  const addRule = (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = ruleText.trim();
+    if (!text) return;
+    const rule: Rule = { id: `u${Date.now().toString(36)}`, text, weekday: ruleWeekday };
+    if (ruleByMonth) {
+      rule.months = [];
+      rule.generatedMonths = [];
+    }
+    saveRules([...rules, rule]);
+    setRuleText('');
+  };
+
+  const removeRule = (rule: Rule) => {
+    if (!confirm(`"${rule.text}" 반복을 삭제할까요?\n앞으로 예정된 할 일도 함께 지워집니다.`)) return;
+    saveRules(rules.filter((r) => r.id !== rule.id));
+    removeInstances(instancePrefix(rule.id), today);
+  };
+
+  const toggleMonth = (rule: Rule, month: string) => {
+    const on = rule.months?.includes(month);
+    const next: Rule = on
+      ? {
+          ...rule,
+          months: (rule.months ?? []).filter((m) => m !== month),
+          generatedMonths: (rule.generatedMonths ?? []).filter((m) => m !== month),
+        }
+      : { ...rule, months: [...(rule.months ?? []), month].sort() };
+    saveRules(rules.map((r) => (r.id === rule.id ? next : r)));
+    if (on) removeInstances(instancePrefix(rule.id, month), today);
+  };
+
+  // 이번 달부터 12개월
+  const monthChoices = useMemo(() => {
+    const base = fromKey(today);
+    return Array.from({ length: 12 }, (_, i) => {
+      const d = new Date(base.getFullYear(), base.getMonth() + i, 1);
+      const key = toKey(d).slice(0, 7);
+      const label =
+        i > 0 && d.getMonth() === 0
+          ? `${String(d.getFullYear()).slice(2)}년 1월`
+          : `${d.getMonth() + 1}월`;
+      return { key, label };
+    });
+  }, [today]);
 
   const startEdit = (t: Todo) => {
     setEditingId(t.id);
@@ -323,6 +456,15 @@ export default function PlannerApp() {
           >
             {syncError ? '⚠ 동기화 오류' : isOnline ? '● 동기화됨' : '○ 오프라인'}
           </span>
+          <button
+            onClick={() => setShowRecurring((v) => !v)}
+            aria-expanded={showRecurring}
+            className={`hover:text-neutral-800 dark:hover:text-neutral-200 ${
+              showRecurring ? 'font-semibold text-blue-600' : ''
+            }`}
+          >
+            반복
+          </button>
           <button onClick={handleLogout} className="hover:text-neutral-800 dark:hover:text-neutral-200">
             로그아웃
           </button>
@@ -335,6 +477,100 @@ export default function PlannerApp() {
           <code className="mx-1">users/&#123;uid&#125;/todos</code>
           접근이 허용되어 있는지 확인해 주세요.
         </p>
+      )}
+
+      {showRecurring && (
+        <section className="mb-5 rounded-2xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+          <h2 className="mb-1 font-bold">반복 할 일</h2>
+          <p className="mb-3 text-sm text-neutral-500">
+            정해 둔 요일마다 할 일이 자동으로 들어갑니다. 달을 고르는 반복은 선택한 달에만 들어갑니다.
+          </p>
+
+          {!settings ? (
+            <p className="py-4 text-center text-sm text-neutral-400">불러오는 중...</p>
+          ) : rules.length === 0 ? (
+            <p className="py-4 text-center text-sm text-neutral-400">반복 할 일이 없습니다.</p>
+          ) : (
+            <ul className="flex flex-col gap-3">
+              {rules.map((rule) => (
+                <li key={rule.id}>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+                      {rule.months ? '선택한 달' : '매주'} {WEEKDAYS[rule.weekday]}
+                    </span>
+                    <span className="min-w-0 flex-1 break-words">{rule.text}</span>
+                    <button
+                      onClick={() => removeRule(rule)}
+                      aria-label={`${rule.text} 반복 삭제`}
+                      className="shrink-0 rounded-lg px-2 py-1 text-neutral-400 hover:bg-neutral-100 hover:text-red-500 dark:hover:bg-neutral-800"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  {rule.months && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {monthChoices.map((m) => {
+                        const on = rule.months!.includes(m.key);
+                        return (
+                          <button
+                            key={m.key}
+                            onClick={() => toggleMonth(rule, m.key)}
+                            aria-pressed={on}
+                            className={`rounded-full border px-3 py-1 text-sm transition-colors ${
+                              on
+                                ? 'border-blue-600 bg-blue-600 font-semibold text-white'
+                                : 'border-neutral-300 text-neutral-600 hover:border-blue-400 dark:border-neutral-700 dark:text-neutral-300'
+                            }`}
+                          >
+                            {m.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <form onSubmit={addRule} className="mt-4 flex flex-col gap-2 border-t border-neutral-200 pt-4 dark:border-neutral-800">
+            <div className="flex gap-2">
+              <select
+                value={ruleWeekday}
+                onChange={(e) => setRuleWeekday(Number(e.target.value))}
+                aria-label="요일"
+                className="rounded-lg border border-neutral-300 bg-white px-2 py-2 dark:border-neutral-700 dark:bg-neutral-900"
+              >
+                {WEEKDAYS.map((w, i) => (
+                  <option key={w} value={i}>
+                    {w}요일
+                  </option>
+                ))}
+              </select>
+              <input
+                value={ruleText}
+                onChange={(e) => setRuleText(e.target.value)}
+                placeholder="반복할 일"
+                className="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-white px-3 py-2 outline-none focus:border-blue-500 dark:border-neutral-700 dark:bg-neutral-900"
+              />
+              <button
+                type="submit"
+                disabled={!ruleText.trim() || !settings}
+                className="rounded-lg bg-blue-600 px-4 font-semibold text-white disabled:opacity-40"
+              >
+                추가
+              </button>
+            </div>
+            <label className="flex items-center gap-2 text-sm text-neutral-600 dark:text-neutral-300">
+              <input
+                type="checkbox"
+                checked={ruleByMonth}
+                onChange={(e) => setRuleByMonth(e.target.checked)}
+              />
+              매주가 아니라, 내가 고른 달에만 넣기
+            </label>
+          </form>
+        </section>
       )}
 
       {/* 주간 날짜 선택 */}
