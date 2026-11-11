@@ -1,0 +1,16 @@
+{
+  "name": "플래너",
+  "short_name": "플래너",
+  "description": "어느 기기에서나 이어 쓰는 할 일 플래너",
+  "id": "/planner",
+  "start_url": "/planner",
+  "scope": "/planner",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    { "src": "/planner-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/planner-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/planner-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
