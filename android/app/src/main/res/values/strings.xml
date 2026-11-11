@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">플래너 위젯</string>
+    <string name="widget_description">오늘 할 일을 홈 화면에서 보고 체크합니다</string>
+    <string name="widget_empty">오늘 할 일이 없습니다</string>
+    <string name="widget_need_login">위쪽 날짜를 눌러 로그인해 주세요</string>
+    <string name="add_hint">할 일 입력</string>
+    <string name="add">추가</string>
+    <string name="cancel">취소</string>
+    <string name="refresh">새로고침</string>
+    <string name="refreshed">위젯을 새로 고쳤습니다</string>
+    <string name="login">Google 계정으로 로그인</string>
+    <string name="logout">로그아웃</string>
+    <string name="pin">홈 화면에 위젯 추가</string>
+    <string name="pin_unsupported">이 홈 화면은 자동 추가를 지원하지 않습니다. 홈 화면 빈 곳을 길게 눌러 위젯 메뉴에서 추가해 주세요.</string>
+    <string name="signed_out">웹 플래너와 같은 Google 계정으로 로그인하면 할 일이 위젯에 나타납니다.</string>
+    <string name="signed_in">%1$s 계정으로 로그인되어 있습니다.\n\n위젯에서 할 일을 누르면 체크되고, + 로 바로 추가할 수 있습니다. 다른 기기에서 바꾼 내용은 15분 안에, 또는 위젯의 ⟳ 를 누르면 바로 반영됩니다.</string>
+    <string name="login_failed">로그인에 실패했습니다.\n%1$s</string>
+    <string name="not_configured">Firebase 설정 파일(google-services.json) 없이 빌드된 앱입니다. android/README.md 의 순서대로 파일을 넣고 다시 빌드해 주세요.</string>
+    <string name="no_web_client">google-services.json 에 웹 클라이언트 ID가 없습니다. Firebase 콘솔에서 Google 로그인을 켠 뒤 파일을 다시 내려받아 주세요.</string>
+</resources>
