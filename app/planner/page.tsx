@@ -4,7 +4,6 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import { db, auth, googleProvider } from '@/lib/firebase';
 import {
   signInWithPopup,
-  signInWithRedirect,
   signOut,
   onAuthStateChanged,
   User,
@@ -70,6 +69,7 @@ export default function PlannerApp() {
   // 어느 계정의 목록인지 함께 들고 있어서, 계정이 바뀌면 이전 목록이 잠깐이라도 보이지 않는다
   const [data, setData] = useState<{ uid: string; todos: Todo[] } | null>(null);
   const [syncError, setSyncError] = useState('');
+  const [loginError, setLoginError] = useState('');
   const isOnline = useSyncExternalStore(subscribeOnline, () => navigator.onLine, () => true);
 
   const [today, setToday] = useState(() => toKey(new Date()));
@@ -126,15 +126,36 @@ export default function PlannerApp() {
   const loaded = !!user && data?.uid === user.uid;
   const todos = useMemo(() => (loaded && data ? data.todos : []), [loaded, data]);
 
+  // 첫 클릭 때 Firebase가 로그인 준비(iframe 로드)를 하느라 시간이 걸리면 브라우저가
+  // "사용자가 누른 것이 아닌 팝업"으로 보고 막아 버린다. 로그인 화면이 뜰 때 미리 준비해 둔다.
+  // (공개 API가 없어 내부 필드를 쓰므로, 없어져도 조용히 넘어가게 한다)
+  useEffect(() => {
+    if (authLoading || user) return;
+    try {
+      const internal = auth as unknown as {
+        _popupRedirectResolver?: { _initialize?: (a: unknown) => Promise<unknown> };
+      };
+      internal._popupRedirectResolver?._initialize?.(auth)?.catch(() => {});
+    } catch {}
+  }, [authLoading, user]);
+
+  // 팝업이 막혔을 때 페이지 이동 방식(signInWithRedirect)으로 넘기지 않는다 — 요즘 브라우저는
+  // 다른 도메인(firebaseapp.com)의 저장소 접근을 막아서, 구글에서 돌아와도 로그인이 되지 않고
+  // 로그인 화면만 다시 뜬다. 대신 팝업을 허용하도록 안내한다.
   const handleLogin = async () => {
+    setLoginError('');
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (e) {
       const err = e as { code?: string; message?: string };
       if (err.code === 'auth/popup-blocked') {
-        await signInWithRedirect(auth, googleProvider);
-      } else if (err.code !== 'auth/popup-closed-by-user' && err.code !== 'auth/cancelled-popup-request') {
-        alert(`로그인 실패 코드: [${err.code}]\n${err.message}`);
+        setLoginError(
+          '브라우저가 로그인 창(팝업)을 막았습니다. 주소창 오른쪽의 팝업 차단 아이콘을 눌러 이 사이트의 팝업을 허용한 뒤, 로그인 버튼을 다시 눌러 주세요.'
+        );
+      } else if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+        setLoginError('로그인 창이 닫혔습니다. 다시 눌러 계정을 선택해 주세요.');
+      } else {
+        setLoginError(`로그인에 실패했습니다. [${err.code}] ${err.message ?? ''}`);
       }
     }
   };
@@ -224,6 +245,14 @@ export default function PlannerApp() {
         >
           Google 계정으로 로그인
         </button>
+        {loginError && (
+          <p
+            role="alert"
+            className="max-w-sm rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300"
+          >
+            {loginError}
+          </p>
+        )}
       </main>
     );
   }
