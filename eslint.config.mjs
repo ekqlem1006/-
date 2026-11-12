@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 별도 프로그램(Go + 순수 JS)이라 Next 규칙 대상이 아님
+    "sermon-prompter/**",
   ]),
 ]);
 

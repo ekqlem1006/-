@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>설교 프롬프터 — 연결 화면</title>
+<style>
+  :root { --line:#d9dee6; --muted:#5d6878; --accent:#2563eb; --ok:#12915a; --bad:#d92d20; --warn:#b76e00; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#f3f5f8; color:#141a23; font-family:"Malgun Gothic","맑은 고딕","Apple SD Gothic Neo",sans-serif; }
+  .wrap { max-width:1080px; margin:0 auto; padding:28px 24px 60px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 22px; }
+  .grid { display:grid; grid-template-columns: 400px 1fr; gap:22px; align-items:start; }
+  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+  .card { background:#fff; border:1px solid var(--line); border-radius:16px; padding:22px; margin-bottom:18px; }
+  .card h2 { font-size:18px; margin:0 0 12px; }
+  .qr { text-align:center; }
+  .qr img { width:100%; max-width:340px; image-rendering:pixelated; border:1px solid var(--line); border-radius:12px; }
+  .qr .big { font-size:19px; font-weight:700; margin:0 0 12px; }
+  .url { font-family:Consolas,monospace; font-size:14px; color:var(--muted); word-break:break-all; margin-top:10px; }
+  .st { display:flex; gap:12px; align-items:flex-start; padding:11px 0; border-bottom:1px solid #eef1f5; }
+  .st:last-child { border-bottom:0; }
+  .st .ic { width:14px; height:14px; border-radius:50%; margin-top:5px; flex:none; background:#c4cbd6; }
+  .st.ok .ic { background:var(--ok); } .st.bad .ic { background:var(--bad); } .st.warn .ic { background:#f0a000; }
+  .st b { display:block; } .st span { color:var(--muted); font-size:14px; }
+  button, .btn { font:inherit; padding:9px 16px; border-radius:10px; border:1px solid var(--line); background:#fff; cursor:pointer; color:inherit; text-decoration:none; display:inline-block; }
+  button.primary, .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:700; }
+  input[type=text] { font:inherit; padding:9px 12px; border:1px solid var(--line); border-radius:10px; width:220px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .muted { color:var(--muted); font-size:14px; line-height:1.6; }
+  details { margin-top:6px; } summary { cursor:pointer; font-weight:700; padding:6px 0; }
+  ol, ul { padding-left:20px; line-height:1.75; margin:8px 0; }
+  .addr button { margin:4px 6px 0 0; padding:5px 10px; font-size:13px; }
+  .addr button.on { border-color:var(--accent); color:var(--accent); font-weight:700; }
+  .warnbox { background:#fff7e6; border:1px solid #f5d08a; border-radius:12px; padding:12px 14px; color:#6b4a00; margin-top:12px; font-size:14px; line-height:1.6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>설교 프롬프터</h1>
+  <p class="sub">이 창은 예배용 컴퓨터의 연결 화면입니다. 창을 닫아도 프로그램은 계속 켜져 있습니다.</p>
+
+  <div class="grid">
+    <div>
+      <div class="card qr">
+        <p class="big">태블릿 카메라로 QR 을 찍으세요</p>
+        <img id="qr" alt="연결용 QR 코드">
+        <div class="url" id="url"></div>
+        <div class="addr" id="addrs"></div>
+        <div class="warnbox" id="noNet" hidden>⚠ 이 컴퓨터가 와이파이(또는 유선 공유기)에 연결되어 있지 않습니다. 네트워크에 연결한 뒤 이 화면을 새로 고쳐 주세요.</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>지금 상태</h2>
+        <div class="st" id="stTablet"><i class="ic"></i><div><b></b><span></span></div></div>
+        <div class="st" id="stPpt"><i class="ic"></i><div><b></b><span></span></div></div>
+        <div class="st" id="stShow"><i class="ic"></i><div><b></b><span></span></div></div>
+        <div class="st" id="stCtl"><i class="ic"></i><div><b></b><span></span></div></div>
+        <div class="row" style="margin-top:14px">
+          <a class="btn primary" href="/">이 컴퓨터에서 대본 준비하기</a>
+          <button id="btnRelease" hidden>태블릿 조작 권한 회수</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>부서 이름</h2>
+        <p class="muted" style="margin-top:0">태블릿 화면 맨 위에 표시됩니다. 여러 부서가 같은 와이파이를 써도, 태블릿은 QR 을 찍은 이 컴퓨터(<b id="pc"></b>)의 PPT 만 조작합니다.</p>
+        <div class="row">
+          <input type="text" id="dept" placeholder="예: 유년부" maxlength="20">
+          <button id="btnDept">저장</button>
+          <span class="muted" id="deptSaved"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>태블릿이 접속되지 않을 때</h2>
+        <ol class="muted">
+          <li>태블릿과 이 컴퓨터가 <b>같은 공유기(와이파이)</b>에 연결되어 있는지 확인합니다. 태블릿이 LTE/5G 데이터로 연결되어 있으면 접속되지 않습니다.</li>
+          <li>프로그램을 처음 켰을 때 뜬 <b>「Windows 보안 경고」</b> 창에서 <b>「액세스 허용」</b>을 누르지 않았다면, 아래 버튼을 눌러 한 번만 허용해 주세요.</li>
+          <li>QR 아래에 주소가 여러 개 보이면 다른 주소를 눌러 QR 을 바꿔서 다시 찍어 봅니다.</li>
+          <li>교회 「손님용(게스트) 와이파이」는 기기끼리의 연결을 막는 경우가 있습니다. 그럴 때는 일반 와이파이를 사용합니다.</li>
+        </ol>
+        <div class="row">
+          <button id="btnFw" hidden>방화벽에서 이 프로그램 허용하기</button>
+          <span class="muted" id="fwMsg"></span>
+        </div>
+        <details>
+          <summary>그 밖의 설정</summary>
+          <p class="muted">저장 폴더: <span id="dataDir"></span><br>버전: <span id="ver"></span></p>
+          <div class="row">
+            <button id="btnNewKey">연결 키 새로 만들기 (이전에 연결한 기기 모두 끊기)</button>
+            <button id="btnQuit">프로그램 종료</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="host.js"></script>
+</body>
+</html>

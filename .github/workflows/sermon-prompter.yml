@@ -1,0 +1,37 @@
+name: 설교 프롬프터 빌드
+
+on:
+  push:
+    paths:
+      - "sermon-prompter/**"
+      - ".github/workflows/sermon-prompter.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sermon-prompter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sermon-prompter/go.mod
+          cache-dependency-path: sermon-prompter/go.sum
+      - name: 대본 자동 연결 로직 시험
+        run: node logic_test.js
+      - name: 검사
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+      - name: 윈도우용 실행 파일 만들기
+        run: GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist/SermonPrompter.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SermonPrompter-windows
+          path: sermon-prompter/dist/SermonPrompter.exe
+          if-no-files-found: error
